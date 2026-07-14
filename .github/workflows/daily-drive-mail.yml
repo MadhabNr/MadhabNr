@@ -1,0 +1,54 @@
+name: Daily Drive Excel Mailer
+
+on:
+  schedule:
+    # GitHub Actions schedule is in UTC. Change this cron as needed.
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  run-daily-mailer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+      GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+      GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
+      GOOGLE_USER_EMAIL: ${{ secrets.GOOGLE_USER_EMAIL }}
+      DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
+      RECIPIENTS: ${{ secrets.RECIPIENTS }}
+      MAIL_SUBJECT: ${{ secrets.MAIL_SUBJECT }}
+      LOG_LEVEL: INFO
+      TZ: Asia/Kathmandu
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily job (with retries)
+        run: |
+          set -euo pipefail
+          max_attempts=3
+          attempt=1
+          until python scripts/daily_drive_mailer.py; do
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "Job failed after ${max_attempts} attempts."
+              exit 1
+            fi
+            attempt=$((attempt + 1))
+            echo "Retrying in 60 seconds (attempt ${attempt}/${max_attempts})..."
+            sleep 60
+          done
+
+      - name: Failure summary
+        if: failure()
+        run: |
+          echo "Daily Drive mailer failed. Check workflow logs for details." >> "$GITHUB_STEP_SUMMARY"
