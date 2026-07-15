@@ -54,3 +54,31 @@ export SMTP_EMAIL="your_gmail@gmail.com"
 export SMTP_APP_PASSWORD="your_16_char_app_password"
 python scripts/daily_drive_mailer.py
 ```
+
+## Multi-tool submission report script
+
+Script:
+- `/home/runner/work/MadhabNr/MadhabNr/scripts/tool_submission_report.py`
+
+Purpose:
+- Reads 5 raw files from the configured Google Drive folder
+- Keeps only essential columns, standardizes schema, and combines data
+- Computes total/latest-date/previous-date submission counts per tool
+- Exports `Tool_Submission_Report.xlsx` with auto-sized columns
+- Creates a run-date subfolder (YYYY-MM-DD) inside the same Drive folder and uploads the report there
+
+Required environment variables:
+- `DRIVE_FOLDER_ID`
+- `GOOGLE_SERVICE_ACCOUNT_JSON` (or `GOOGLE_SERVICE_ACCOUNT_FILE=credential.json`)
+
+Optional:
+- `LOCAL_OUTPUT_PATH` (default: `/tmp/<run-date>/Tool_Submission_Report.xlsx`)
+
+Run:
+
+```bash
+pip install -r requirements.txt
+export GOOGLE_SERVICE_ACCOUNT_FILE=credential.json
+export DRIVE_FOLDER_ID="your_drive_folder_id"
+python scripts/tool_submission_report.py
+```
