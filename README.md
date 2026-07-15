@@ -16,24 +16,23 @@ This repository now includes an automated Python workflow that:
 ## Google setup
 
 1. Create a Google Cloud project.
-2. Enable **Google Drive API** and **Gmail API**.
-3. Create OAuth client credentials.
-4. Obtain a refresh token for the Gmail/Drive account you want to use.
-5. Share the Drive folder with that account if required.
+2. Enable **Google Drive API**.
+3. Create a **Service Account** and download `credential.json`.
+4. Share the target Drive folder with the service-account email.
+5. In Gmail, enable 2FA and generate an **App Password** for SMTP sending.
 
 ## Required GitHub Secrets
 
 Set these repository secrets:
 
-- `GOOGLE_CLIENT_ID`
-- `GOOGLE_CLIENT_SECRET`
-- `GOOGLE_REFRESH_TOKEN`
+- `GOOGLE_SERVICE_ACCOUNT_JSON` (full JSON content from `credential.json`)
 - `DRIVE_FOLDER_ID`
 - `RECIPIENTS` (comma-separated emails)
+- `SMTP_EMAIL` (your Gmail address)
+- `SMTP_APP_PASSWORD` (Gmail app password)
 
 Optional:
 
-- `GOOGLE_USER_EMAIL` (default: `me`)
 - `MAIL_SUBJECT`
 
 ## Schedule configuration
@@ -48,5 +47,10 @@ Workflow file: `/home/runner/work/MadhabNr/MadhabNr/.github/workflows/daily-driv
 
 ```bash
 pip install -r requirements.txt
+export GOOGLE_SERVICE_ACCOUNT_FILE=credential.json
+export DRIVE_FOLDER_ID="your_drive_folder_id"
+export RECIPIENTS="a@example.com,b@example.com"
+export SMTP_EMAIL="your_gmail@gmail.com"
+export SMTP_APP_PASSWORD="your_16_char_app_password"
 python scripts/daily_drive_mailer.py
 ```
