@@ -40,7 +40,7 @@ jobs:
           set -euo pipefail
           max_attempts=3
           attempt=1
-          until python scripts/daily_drive_mailer.py; do
+          until python scripts/tool_submission_report.py; do
             if [ "$attempt" -ge "$max_attempts" ]; then
               echo "Job failed after ${max_attempts} attempts."
               exit 1
