@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import sys
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List
@@ -222,6 +224,45 @@ def upload_to_drive_folder(drive_service, local_file: Path, target_folder_id: st
     uploaded = drive_service.files().create(body=file_metadata, media_body=media, fields="id,name,webViewLink").execute()
     return uploaded.get("webViewLink", "")
 
+def parse_recipients() -> List[str]:
+    recipients = [
+        item.     for item in required_env("RECIPIENTS").split(",")
+        if item.strip()
+    ]
+    if not recipients:
+        raise ValueError("RECIPIENTS must contain at least one email address")
+    return recipients
+
+
+def send_email_with_attachment(
+    sender_email: str,
+    app_password: str,
+    recipients: List[str],
+    attachment_path: Path,
+) -> None:
+
+    msg = EmailMessage()
+
+    msg["From"] = sender_email
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = "Daily Tool Submission Report"
+
+    msg.set_content(
+        "Please find attached the latest Tool Submission Report."
+    )
+
+    with open(attachment_path, "rb") as f:
+        msg.add_attachment(
+            f.read(),
+            maintype="application",
+            subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            filename=attachment_path.name,
+        )
+
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=60) as server:
+        server.starttls()
+        server.login(sender_email, app_password)
+        server.send_message(msg)
 
 def main() -> int:
     logging.basicConfig(
@@ -240,7 +281,18 @@ def main() -> int:
         report_df = build_report_frame(master_df)
         export_report(report_df, local_output)
 
-        logging.info("Report generated successfully: %s", local_output)
+        sender_email = required_env("SMTP_EMAIL")
+        app_password = required_env("SMTP_APP_PASSWORD")
+        recipients = parse_recipients()
+        
+        send_email_with_attachment(
+            sender_email,
+            app_password,
+            recipients,
+            local_output,
+        )
+        
+        logging.info("Report generated and emailed: %s", local_output)
         return 0
     except (ValueError, FileNotFoundError) as exc:
         logging.error("Configuration/runtime error: %s", exc)
@@ -248,6 +300,9 @@ def main() -> int:
     except HttpError as exc:
         logging.error("Google API request failed: %s", exc)
         return 3
+    except smtplib.SMTPException as exc:
+        logging.error("SMTP request failed: %s", exc)
+        return 4
     except Exception as exc:
         logging.exception("Unexpected failure: %s", exc)
         return 1
