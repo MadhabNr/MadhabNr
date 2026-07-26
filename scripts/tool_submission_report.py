@@ -240,10 +240,7 @@ def main() -> int:
         report_df = build_report_frame(master_df)
         export_report(report_df, local_output)
 
-        output_folder_id = create_or_get_drive_subfolder(drive_service, source_folder_id, run_date_name)
-        link = upload_to_drive_folder(drive_service, local_output, output_folder_id)
-        logging.info("Report generated: %s", local_output)
-        logging.info("Uploaded to Drive subfolder '%s'. Link: %s", run_date_name, link or "N/A")
+        logging.info("Report generated successfully: %s", local_output)
         return 0
     except (ValueError, FileNotFoundError) as exc:
         logging.error("Configuration/runtime error: %s", exc)
