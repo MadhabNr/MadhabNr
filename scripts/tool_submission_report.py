@@ -8,16 +8,16 @@ import smtplib
 from email.message import EmailMessage
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List
+from typing import List
 
 import pandas as pd
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+from googleapiclient.http import MediaIoBaseDownload
 from openpyxl.utils import get_column_letter
 
-DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive"]
+DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 SOURCE_COLUMNS = ["SubmissionDate", "STATE", "Cal_DIST", "F_Type", "Cal_Facility", "QDC"]
 COLUMN_RENAME = {
     "SubmissionDate": "Date",
@@ -193,40 +193,10 @@ def export_report(report_df: pd.DataFrame, output_path: Path) -> None:
         autosize_worksheet(writer.book["Submission_Report"])
 
 
-def create_or_get_drive_subfolder(drive_service, parent_folder_id: str, subfolder_name: str) -> str:
-    safe_name = escape_drive_query_value(subfolder_name)
-    query = (
-        f"'{parent_folder_id}' in parents and trashed = false and "
-        "mimeType = 'application/vnd.google-apps.folder' and "
-        f"name = '{safe_name}'"
-    )
-    response = (
-        drive_service.files()
-        .list(q=query, spaces="drive", fields="files(id,name)", pageSize=1)
-        .execute()
-    )
-    files = response.get("files", [])
-    if files:
-        return files[0]["id"]
-
-    metadata = {
-        "name": subfolder_name,
-        "mimeType": "application/vnd.google-apps.folder",
-        "parents": [parent_folder_id],
-    }
-    created = drive_service.files().create(body=metadata, fields="id").execute()
-    return created["id"]
-
-
-def upload_to_drive_folder(drive_service, local_file: Path, target_folder_id: str) -> str:
-    file_metadata = {"name": local_file.name, "parents": [target_folder_id]}
-    media = MediaFileUpload(local_file.as_posix(), mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    uploaded = drive_service.files().create(body=file_metadata, media_body=media, fields="id,name,webViewLink").execute()
-    return uploaded.get("webViewLink", "")
-
 def parse_recipients() -> List[str]:
     recipients = [
-        item.     for item in required_env("RECIPIENTS").split(",")
+        item.strip()
+        for item in required_env("RECIPIENTS").split(",")
         if item.strip()
     ]
     if not recipients:
@@ -240,16 +210,11 @@ def send_email_with_attachment(
     recipients: List[str],
     attachment_path: Path,
 ) -> None:
-
     msg = EmailMessage()
-
     msg["From"] = sender_email
     msg["To"] = ", ".join(recipients)
-    msg["Subject"] = "Daily Tool Submission Report"
-
-    msg.set_content(
-        "Please find attached the latest Tool Submission Report."
-    )
+    msg["Subject"] = os.getenv("MAIL_SUBJECT", "Daily Tool Submission Report").strip() or "Daily Tool Submission Report"
+    msg.set_content("Please find attached the latest Tool Submission Report.")
 
     with open(attachment_path, "rb") as f:
         msg.add_attachment(
@@ -263,6 +228,7 @@ def send_email_with_attachment(
         server.starttls()
         server.login(sender_email, app_password)
         server.send_message(msg)
+
 
 def main() -> int:
     logging.basicConfig(
@@ -281,17 +247,19 @@ def main() -> int:
         report_df = build_report_frame(master_df)
         export_report(report_df, local_output)
 
+        logging.info("EMAIL ATTACHMENT MODE ACTIVATED")
+
         sender_email = required_env("SMTP_EMAIL")
         app_password = required_env("SMTP_APP_PASSWORD")
         recipients = parse_recipients()
-        
+
         send_email_with_attachment(
             sender_email,
             app_password,
             recipients,
             local_output,
         )
-        
+
         logging.info("Report generated and emailed: %s", local_output)
         return 0
     except (ValueError, FileNotFoundError) as exc:
