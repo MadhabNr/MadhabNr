@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Download GAVB WIDE CSVs from Google Drive and create one Excel workbook per state.
+"""Create separate state-wise Excel workbooks from CSV files in Google Drive.
 
-Google Drive authentication, filename lookup, and byte-download structure are kept
-in the same form as the original script supplied by the user.
+Google Drive authentication, exact-name lookup, downloading, and CSV reading follow
+the same structure as the original script. Each source CSV contains one data table;
+no input worksheet name is configured or used.
 """
-from __future__ import annotations
 
 import io
 import json
@@ -27,24 +27,40 @@ from openpyxl.utils import get_column_letter
 
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
-TOOL_FILES: List[Dict[str, str]] = [
-    {"tool_name": "DOD", "filename": "DOD_2026_WIDE.csv", "sheet_name": "DOD_2026_WIDE"},
-    {"tool_name": "Maternal Log", "filename": "Maternal Log_WIDE.csv", "sheet_name": "Maternal_Log_WIDE"},
-    {"tool_name": "FIS", "filename": "FIS CASE RECORDS 2026_WIDE.csv", "sheet_name": "FIS_CASE_RECORDS_2026_WIDE"},
-    {"tool_name": "PMSMA", "filename": "PMSMA Client Interview_WIDE.csv", "sheet_name": "PMSMA_Client_Interview_WIDE"},
-    {"tool_name": "SNCU", "filename": "SNCU Index Cases Observation 2026_WIDE.csv", "sheet_name": "SNCU_Index_Cases_Obs_2026"},
-    {"tool_name": "Referral Services", "filename": "GABV IDD Referral_WIDE.csv", "sheet_name": "IDD_Referral_WIDE"},
-    {"tool_name": "Digital System", "filename": "GAVB IDD Digital System_WIDE.csv", "sheet_name": "IDD_Digital_System_WIDE"},
-    {"tool_name": "Exit Interview", "filename": "GAVB IDD Exit Interview_WIDE.csv", "sheet_name": "IDD_Exit_Interview_WIDE"},
-    {"tool_name": "HR", "filename": "GAVB IDD HR_WIDE.csv", "sheet_name": "IDD_HR_WIDE"},
-    {"tool_name": "Labour Room Readiness", "filename": "GAVB IDD Labour Room Readiness_WIDE.csv", "sheet_name": "IDD_LR_Readiness_WIDE"},
-    {"tool_name": "Supply Chain", "filename": "GAVB IDD Supply Chain_WIDE.csv", "sheet_name": "IDD_Supply_Chain_WIDE"},
+# Same configuration style as the old code: tool name, exact Drive filename, reader.
+# No input sheet name is required because all source files are CSV files.
+TOOL_FILES = [
+    {"tool_name": "DOD", "filename": "DOD_2026_WIDE.csv", "reader": "csv"},
+    {"tool_name": "Maternal_Log", "filename": "Maternal Log_WIDE.csv", "reader": "csv"},
+    {"tool_name": "FIS", "filename": "FIS CASE RECORDS 2026_WIDE.csv", "reader": "csv"},
+    {"tool_name": "PMSMA", "filename": "PMSMA Client Interview_WIDE.csv", "reader": "csv"},
+    {"tool_name": "SNCU", "filename": "SNCU Index Cases Observation 2026_WIDE.csv", "reader": "csv"},
+    {"tool_name": "Referral_Services", "filename": "GABV IDD Referral_WIDE.csv", "reader": "csv"},
+    {"tool_name": "Digital_System", "filename": "GAVB IDD Digital System_WIDE.csv", "reader": "csv"},
+    {"tool_name": "Exit_Interview", "filename": "GAVB IDD Exit Interview_WIDE.csv", "reader": "csv"},
+    {"tool_name": "HR", "filename": "GAVB IDD HR_WIDE.csv", "reader": "csv"},
+    {"tool_name": "Labour_Room_Readiness", "filename": "GAVB IDD Labour Room Readiness_WIDE.csv", "reader": "csv"},
+    {"tool_name": "Supply_Chain", "filename": "GAVB IDD Supply Chain_WIDE.csv", "reader": "csv"},
 ]
+
+TOOL_LABELS = {
+    "DOD": "DOD",
+    "Maternal_Log": "Maternal Log",
+    "FIS": "FIS",
+    "PMSMA": "PMSMA",
+    "SNCU": "SNCU",
+    "Referral_Services": "Referral Services",
+    "Digital_System": "Digital System",
+    "Exit_Interview": "Exit Interview",
+    "HR": "HR",
+    "Labour_Room_Readiness": "Labour Room Readiness",
+    "Supply_Chain": "Supply Chain",
+}
 TOOL_ORDER = [item["tool_name"] for item in TOOL_FILES]
 
-COLUMN_ALIASES: Dict[str, List[str]] = {
-    "state": ["STATE", "State", "state", "state_name", "Cal_STATE"],
-    "district": ["Cal_DIST", "District", "DISTRICT", "district_name"],
+COLUMN_ALIASES = {
+    "state": ["STATE", "State", "state", "Cal_STATE", "state_name"],
+    "district": ["Cal_DIST", "District", "DISTRICT", "district", "district_name"],
     "investigator": [
         "QDC", "Investigator", "Nurse", "Nurse_Name", "Nursing_Consultant",
         "Name of Nursing Consultants", "Name of Nurses", "collector_name",
@@ -60,7 +76,7 @@ COLUMN_ALIASES: Dict[str, List[str]] = {
 DH_VALUES = {"dh", "district hospital", "district_hospital", "district hospital dh"}
 DAY_START_HOUR = 9
 DAY_END_HOUR = 18
-DEFAULT_STATE_SPOC = {"Assam": "L"}
+DEFAULT_STATE_SPOC = {"Assam": "Nikhil Kumar"}
 
 HEADER_FILL = PatternFill("solid", fgColor="B7DEE8")
 TOTAL_FILL = PatternFill("solid", fgColor="B7DEE8")
@@ -68,9 +84,9 @@ THIN = Side(style="thin", color="000000")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
 
-# -----------------------------------------------------------------------------
-# GOOGLE DRIVE FUNCTIONS: kept in the same structure as the original code
-# -----------------------------------------------------------------------------
+# =============================================================================
+# ORIGINAL GOOGLE DRIVE READING STRUCTURE
+# =============================================================================
 def escape_drive_query_value(value: str) -> str:
     return value.replace("\\", "\\\\").replace("'", "\\'")
 
@@ -129,9 +145,22 @@ def download_drive_file_bytes(drive_service, file_id: str) -> bytes:
     return file_buffer.getvalue()
 
 
-# -----------------------------------------------------------------------------
-# CSV READING AND STANDARDIZATION
-# -----------------------------------------------------------------------------
+def read_tool_file(data: bytes, reader: str) -> pd.DataFrame:
+    data_stream = io.BytesIO(data)
+    if reader == "csv":
+        # Same byte-stream reading pattern as the old code. utf-8-sig also reads
+        # normal UTF-8 and safely removes a BOM when one is present.
+        return pd.read_csv(
+            data_stream,
+            low_memory=False,
+            encoding="utf-8-sig",
+        )
+    raise ValueError(f"Unsupported reader: {reader}")
+
+
+# =============================================================================
+# STANDARDIZATION AND DATE PARSING
+# =============================================================================
 def normalize(value: object) -> str:
     return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
 
@@ -145,31 +174,14 @@ def clean_text(series: pd.Series) -> pd.Series:
 def find_column(columns: Sequence[object], aliases: Sequence[str]) -> Optional[str]:
     lookup = {normalize(column): str(column) for column in columns}
     for alias in aliases:
-        if normalize(alias) in lookup:
-            return lookup[normalize(alias)]
+        key = normalize(alias)
+        if key in lookup:
+            return lookup[key]
     return None
 
 
-def read_tool_file(data: bytes) -> Tuple[pd.DataFrame, str]:
-    """Read a downloaded CSV from bytes, trying common encodings."""
-    last_error: Optional[Exception] = None
-    for encoding in ("utf-8-sig", "utf-8", "cp1252", "latin1"):
-        try:
-            frame = pd.read_csv(
-                io.BytesIO(data),
-                encoding=encoding,
-                sep=None,
-                engine="python",
-                low_memory=False,
-            )
-            return frame, encoding
-        except Exception as exc:
-            last_error = exc
-    raise ValueError(f"Unable to read downloaded CSV: {last_error}")
-
-
 def parse_submission_datetime(series: pd.Series) -> pd.Series:
-    """Parse exact values such as 27/01/2026, 19:01:46, then try variants."""
+    """Parse SubmissionDate values such as 27/01/2026, 19:01:46."""
     text = clean_text(series)
     parsed = pd.to_datetime(
         text,
@@ -197,6 +209,7 @@ def standardize_frame(
         key: find_column(raw.columns, aliases)
         for key, aliases in COLUMN_ALIASES.items()
     }
+
     if not detected["state"] or not detected["investigator"]:
         raise ValueError(
             f"{filename}: missing State or Investigator/QDC column. "
@@ -209,9 +222,9 @@ def standardize_frame(
 
     level_source = detected["facility_level"] or detected["facility_type"]
     if level_source:
-        dh_normalized = {normalize(value) for value in DH_VALUES}
+        dh_values = {normalize(value) for value in DH_VALUES}
         frame["__FacilityLevel"] = clean_text(frame[level_source]).map(
-            lambda value: "DH" if normalize(value) in dh_normalized else "Below DH"
+            lambda value: "DH" if normalize(value) in dh_values else "Below DH"
         )
     else:
         frame["__FacilityLevel"] = "Unclassified"
@@ -224,8 +237,9 @@ def standardize_frame(
         frame["__SubmissionDateTime"] = pd.NaT
 
     frame["__Tool"] = tool_name
+
     log = {
-        "Tool": tool_name,
+        "Tool": TOOL_LABELS[tool_name],
         "File": filename,
         "Rows_Read": len(raw),
         "Rows_With_State": int(frame["__State"].notna().sum()),
@@ -257,15 +271,14 @@ def load_and_standardize_data(
         try:
             file_id = find_file_id_by_name(drive_service, source_folder_id, filename)
             raw_bytes = download_drive_file_bytes(drive_service, file_id)
-            raw_frame, encoding = read_tool_file(raw_bytes)
+            raw_frame = read_tool_file(raw_bytes, item["reader"])
             frame, log = standardize_frame(raw_frame, tool_name, filename)
-            log["Encoding"] = encoding
             frames[tool_name] = frame
             logs.append(log)
         except Exception as exc:
             logging.exception("Could not process %s", filename)
             logs.append({
-                "Tool": tool_name,
+                "Tool": TOOL_LABELS[tool_name],
                 "File": filename,
                 "Rows_Read": 0,
                 "Status": f"ERROR: {exc}",
@@ -276,9 +289,9 @@ def load_and_standardize_data(
     return frames, pd.DataFrame(logs)
 
 
-# -----------------------------------------------------------------------------
-# STATE-WISE REPORT TABLES
-# -----------------------------------------------------------------------------
+# =============================================================================
+# REPORT TABLES
+# =============================================================================
 def filter_state(frame: pd.DataFrame, state: str) -> pd.DataFrame:
     return frame.loc[
         frame["__State"].fillna("").str.casefold() == state.casefold()
@@ -286,23 +299,23 @@ def filter_state(frame: pd.DataFrame, state: str) -> pd.DataFrame:
 
 
 def get_states(frames: Dict[str, pd.DataFrame]) -> List[str]:
-    values = {
+    states = {
         str(value).strip()
         for frame in frames.values()
         for value in frame["__State"].dropna().unique()
         if str(value).strip()
     }
-    return sorted(values, key=str.casefold)
+    return sorted(states, key=str.casefold)
 
 
 def get_investigators(state_frames: Dict[str, pd.DataFrame]) -> List[str]:
-    values = {
+    investigators = {
         str(value).strip()
         for frame in state_frames.values()
         for value in frame["__Investigator"].dropna().unique()
         if str(value).strip()
     }
-    return sorted(values, key=str.casefold)
+    return sorted(investigators, key=str.casefold)
 
 
 def count_by_investigator(
@@ -311,21 +324,24 @@ def count_by_investigator(
     if frame is None or frame.empty:
         return [0] * len(investigators)
     grouped = frame.dropna(subset=["__Investigator"]).groupby("__Investigator").size()
-    lookup = {str(name).strip().casefold(): int(count) for name, count in grouped.items()}
+    lookup = {
+        str(name).strip().casefold(): int(count)
+        for name, count in grouped.items()
+    }
     return [lookup.get(name.casefold(), 0) for name in investigators]
 
 
 def build_nurse_wise(
     state_frames: Dict[str, pd.DataFrame], investigators: List[str]
 ) -> pd.DataFrame:
-    output = pd.DataFrame({"Name of Nursing Consultants": investigators})
+    report = pd.DataFrame({"Name of Nursing Consultants": investigators})
     for tool_name in TOOL_ORDER:
-        output[f"# {tool_name}"] = count_by_investigator(
+        report[f"# {TOOL_LABELS[tool_name]}"] = count_by_investigator(
             state_frames.get(tool_name), investigators
         )
-    total = {output.columns[0]: "Grand Total"}
-    total.update({column: int(output[column].sum()) for column in output.columns[1:]})
-    return pd.concat([output, pd.DataFrame([total])], ignore_index=True)
+    total = {report.columns[0]: "Grand Total"}
+    total.update({column: int(report[column].sum()) for column in report.columns[1:]})
+    return pd.concat([report, pd.DataFrame([total])], ignore_index=True)
 
 
 def build_dh_below_dh(
@@ -337,12 +353,16 @@ def build_dh_below_dh(
     for tool_name in TOOL_ORDER:
         frame = state_frames.get(tool_name)
         for level in ("Below DH", "DH"):
-            subset = None if frame is None else frame.loc[frame["__FacilityLevel"] == level]
-            data[(tool_name, level)] = count_by_investigator(subset, investigators)
-    output = pd.DataFrame(data)
-    total = {output.columns[0]: "Grand Total"}
-    total.update({column: int(output[column].sum()) for column in output.columns[1:]})
-    return pd.concat([output, pd.DataFrame([total])], ignore_index=True)
+            subset = None if frame is None else frame.loc[
+                frame["__FacilityLevel"] == level
+            ]
+            data[(TOOL_LABELS[tool_name], level)] = count_by_investigator(
+                subset, investigators
+            )
+    report = pd.DataFrame(data)
+    total = {report.columns[0]: "Grand Total"}
+    total.update({column: int(report[column].sum()) for column in report.columns[1:]})
+    return pd.concat([report, pd.DataFrame([total])], ignore_index=True)
 
 
 def fis_shift_counts(
@@ -362,59 +382,63 @@ def build_summary(
     investigators: List[str],
     spoc_map: Dict[str, str],
 ) -> pd.DataFrame:
-    output = pd.DataFrame({
+    report = pd.DataFrame({
         "Name of Nursing Consultants": investigators,
         "State": [state] * len(investigators),
         "State SPOC": [spoc_map.get(state, "")] * len(investigators),
     })
     for tool_name in TOOL_ORDER:
-        output[tool_name] = count_by_investigator(
+        report[TOOL_LABELS[tool_name]] = count_by_investigator(
             state_frames.get(tool_name), investigators
         )
-    fis_position = output.columns.get_loc("FIS") + 1
-    output.insert(
+
+    fis_position = report.columns.get_loc("FIS") + 1
+    report.insert(
         fis_position,
         "FIS-Day (9AM-6PM)",
         fis_shift_counts(state_frames.get("FIS"), investigators, day=True),
     )
-    output.insert(
+    report.insert(
         fis_position + 1,
         "FIS-Night (6PM-9AM)",
         fis_shift_counts(state_frames.get("FIS"), investigators, day=False),
     )
-    return output
+    return report
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # EXCEL EXPORT
-# -----------------------------------------------------------------------------
+# =============================================================================
 def safe_filename(value: str) -> str:
     return re.sub(r'[<>:"/\\|?*]+', "_", value).strip() or "Unknown_State"
 
 
-def safe_sheet_name(value: str) -> str:
-    return re.sub(r'[\\/*?:\[\]]', "_", value).strip()[:31] or "Sheet"
+def source_sheet_name(filename: str) -> str:
+    """Derive the output raw-data sheet name from filename, not input metadata."""
+    stem = Path(filename).stem
+    cleaned = re.sub(r'[\\/*?:\[\]]', "_", stem).strip()
+    return cleaned[:31] or "Raw_Data"
 
 
 def raw_for_export(frame: pd.DataFrame) -> pd.DataFrame:
-    return frame.drop(
-        columns=[column for column in frame.columns if str(column).startswith("__")],
-        errors="ignore",
-    )
+    helper_columns = [
+        column for column in frame.columns if str(column).startswith("__")
+    ]
+    return frame.drop(columns=helper_columns, errors="ignore")
 
 
 def autosize_worksheet(worksheet, maximum: int = 40) -> None:
     for column_index in range(1, worksheet.max_column + 1):
         letter = get_column_letter(column_index)
-        lengths = [
-            len(str(cell.value)) if cell.value is not None else 0
-            for cell in worksheet[letter]
-        ]
-        worksheet.column_dimensions[letter].width = min(max(lengths + [8]) + 2, maximum)
+        max_length = 0
+        for cell in worksheet[letter]:
+            value = "" if cell.value is None else str(cell.value)
+            max_length = max(max_length, len(value))
+        worksheet.column_dimensions[letter].width = min(max(max_length + 2, 10), maximum)
 
 
-def style_workbook(path: Path) -> None:
-    workbook = load_workbook(path)
+def style_workbook(output_path: Path) -> None:
+    workbook = load_workbook(output_path)
     for worksheet in workbook.worksheets:
         if worksheet.title == "Summary":
             header_rows = (3,)
@@ -426,11 +450,13 @@ def style_workbook(path: Path) -> None:
             header_rows = (1,)
             worksheet.freeze_panes = "A2"
 
-        for row_number in header_rows:
-            for cell in worksheet[row_number]:
+        for header_row in header_rows:
+            for cell in worksheet[header_row]:
                 cell.fill = HEADER_FILL
                 cell.font = Font(bold=True)
-                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+                cell.alignment = Alignment(
+                    horizontal="center", vertical="center", wrap_text=True
+                )
                 cell.border = BORDER
 
         for row in worksheet.iter_rows():
@@ -443,7 +469,7 @@ def style_workbook(path: Path) -> None:
                 cell.font = Font(bold=True)
 
         autosize_worksheet(worksheet)
-    workbook.save(path)
+    workbook.save(output_path)
 
 
 def create_state_workbook(
@@ -459,7 +485,7 @@ def create_state_workbook(
     }
     investigators = get_investigators(state_frames)
     if not investigators:
-        logging.warning("Skipping %s: no investigator names", state)
+        logging.warning("Skipping %s because no investigator was found", state)
         return None
 
     output_folder.mkdir(parents=True, exist_ok=True)
@@ -479,12 +505,13 @@ def create_state_workbook(
             writer, sheet_name="Summary", index=False, startrow=2
         )
 
+        # Raw-data output sheet names are automatically derived from CSV filenames.
         for item in TOOL_FILES:
             tool_name = item["tool_name"]
             if tool_name in state_frames:
                 raw_for_export(state_frames[tool_name]).to_excel(
                     writer,
-                    sheet_name=safe_sheet_name(item["sheet_name"]),
+                    sheet_name=source_sheet_name(item["filename"]),
                     index=False,
                 )
 
@@ -509,7 +536,7 @@ def parse_state_spoc() -> Dict[str, str]:
         supplied = json.loads(raw)
         if not isinstance(supplied, dict):
             raise ValueError("STATE_SPOC_JSON must be a JSON object")
-        mapping.update({str(k).strip(): str(v).strip() for k, v in supplied.items()})
+        mapping.update({str(key).strip(): str(value).strip() for key, value in supplied.items()})
     return mapping
 
 
@@ -535,11 +562,11 @@ def main() -> int:
         )
         states = get_states(frames)
 
-        requested_states = os.getenv("STATES", "").strip()
-        if requested_states:
+        selected_states = os.getenv("STATES", "").strip()
+        if selected_states:
             wanted = {
                 value.strip().casefold()
-                for value in requested_states.split(",")
+                for value in selected_states.split(",")
                 if value.strip()
             }
             states = [state for state in states if state.casefold() in wanted]
@@ -550,19 +577,19 @@ def main() -> int:
         spoc_map = parse_state_spoc()
         created: List[Path] = []
         for state in states:
-            output = create_state_workbook(
+            output_path = create_state_workbook(
                 state, frames, processing_log, output_folder, spoc_map
             )
-            if output:
-                created.append(output)
-                logging.info("Created state workbook: %s", output)
+            if output_path:
+                created.append(output_path)
+                logging.info("Created state workbook: %s", output_path)
 
         if not created:
             raise ValueError("No state workbook was created.")
 
         print("Created state workbooks:")
-        for output in created:
-            print(f" - {output}")
+        for output_path in created:
+            print(f" - {output_path}")
         return 0
 
     except (ValueError, FileNotFoundError) as exc:
