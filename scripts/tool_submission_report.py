@@ -343,9 +343,16 @@ def build_dh_below_dh(state_frames, investigators):
 def fis_shift_counts(frame, investigators, day: bool):
     if frame is None or frame.empty:
         return [0] * len(investigators)
+
+    valid_datetime = frame["__DateTime"].notna()
     hours = frame["__DateTime"].dt.hour
-    day_mask = (hours >= DAY_START_HOUR) & (hours < DAY_END_HOUR)
-    subset = frame.loc[day_mask if day else (~day_mask & hours.notna())]
+    day_mask = valid_datetime & (hours >= DAY_START_HOUR) & (hours < DAY_END_HOUR)
+
+    if day:
+        subset = frame.loc[day_mask]
+    else:
+        subset = frame.loc[valid_datetime & ~day_mask]
+
     return count_by_investigator(subset, investigators)
 
 
@@ -461,13 +468,65 @@ def create_state_workbook(
             worksheet.set_column(index, index, width)
         worksheet.set_row(len(nurse_df), None, total_format)
 
-        dh_df.to_excel(
-            writer, sheet_name="DH & Below DH", index=False, merge_cells=True
+        # -----------------------------------------------------------------
+        # DH & Below DH sheet fix
+        # -----------------------------------------------------------------
+        # dh_df intentionally has two-level MultiIndex columns. Pandas does
+        # not support writing MultiIndex columns with index=False. Therefore,
+        # write a temporary single-level copy without a header and construct
+        # the original two-row header manually through XlsxWriter.
+        dh_export_df = dh_df.copy()
+        dh_export_df.columns = [
+            f"column_{column_number}"
+            for column_number in range(len(dh_export_df.columns))
+        ]
+        dh_export_df.to_excel(
+            writer,
+            sheet_name="DH & Below DH",
+            index=False,
+            header=False,
+            startrow=2,
         )
         worksheet = writer.sheets["DH & Below DH"]
+
+        first_top_header = str(dh_df.columns[0][0]).strip()
+        first_bottom_header = str(dh_df.columns[0][1]).strip()
+        first_header = first_bottom_header or first_top_header
+        worksheet.merge_range(0, 0, 1, 0, first_header, header_format)
+
+        for column_index in range(1, len(dh_df.columns)):
+            lower_header = str(dh_df.columns[column_index][1]).strip()
+            worksheet.write(1, column_index, lower_header, header_format)
+
+        column_index = 1
+        while column_index < len(dh_df.columns):
+            upper_header = str(dh_df.columns[column_index][0]).strip()
+            merge_start = column_index
+            merge_end = column_index
+
+            while (
+                merge_end + 1 < len(dh_df.columns)
+                and str(dh_df.columns[merge_end + 1][0]).strip() == upper_header
+            ):
+                merge_end += 1
+
+            if merge_start == merge_end:
+                worksheet.write(0, merge_start, upper_header, header_format)
+            else:
+                worksheet.merge_range(
+                    0,
+                    merge_start,
+                    0,
+                    merge_end,
+                    upper_header,
+                    header_format,
+                )
+
+            column_index = merge_end + 1
+
         worksheet.freeze_panes(2, 1)
-        worksheet.set_row(0, 30, header_format)
-        worksheet.set_row(1, 30, header_format)
+        worksheet.set_row(0, 30)
+        worksheet.set_row(1, 30)
         for index, width in enumerate(sample_widths(dh_df, 100, 22)):
             worksheet.set_column(index, index, width)
         worksheet.set_row(len(dh_df) + 1, None, total_format)
@@ -511,9 +570,7 @@ def create_state_workbook(
                     0, 0, len(raw_frame), len(raw_frame.columns) - 1
                 )
                 worksheet.set_row(0, 30, header_format)
-                for index, width in enumerate(
-                    sample_widths(raw_frame, 25, 24)
-                ):
+                for index, width in enumerate(sample_widths(raw_frame, 25, 24)):
                     worksheet.set_column(index, index, width)
 
         state_log = processing_log.assign(State_Workbook=state)
@@ -619,4 +676,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
- 
