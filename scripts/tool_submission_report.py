@@ -20,6 +20,8 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
+SCRIPT_VERSION = "2026-08-21-multiindex-fix-v2"
+
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 TOOL_FILES = [
@@ -605,6 +607,7 @@ def main() -> int:
         format="%(asctime)s [%(levelname)s] %(message)s",
     )
     try:
+        logging.info("Running tool submission report version: %s", SCRIPT_VERSION)
         source_folder_id = required_env("DRIVE_FOLDER_ID")
         run_date_name = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         output_folder = Path(
