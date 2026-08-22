@@ -17,7 +17,7 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
-SCRIPT_VERSION = "2026-08-21-flat-dh-columns-v3"
+SCRIPT_VERSION = "2026-08-22-multiindex-safe-v1"
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 
 TOOL_FILES = [
@@ -187,6 +187,32 @@ def parse_submission_datetime(series):
     return parsed
 
 
+def flatten_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy with guaranteed flat string columns (no MultiIndex)."""
+    out = df.copy()
+
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = [
+            " - ".join([str(x).strip() for x in tup if str(x).strip() not in ("", "nan", "None")]).strip()
+            for tup in out.columns.to_flat_index()
+        ]
+    else:
+        out.columns = [str(c) for c in out.columns]
+
+    # Ensure uniqueness in case flattening creates duplicate names
+    seen = {}
+    fixed = []
+    for c in out.columns:
+        if c not in seen:
+            seen[c] = 0
+            fixed.append(c)
+        else:
+            seen[c] += 1
+            fixed.append(f"{c}.{seen[c]}")
+    out.columns = fixed
+    return out
+
+
 def standardize_frame(raw, tool_name, filename):
     detected = {k: find_column(raw.columns, a) for k, a in COLUMN_ALIASES.items()}
 
@@ -319,7 +345,6 @@ def build_nurse_wise(state_frames, investigators):
 
 
 def build_dh_below_dh(state_frames, investigators):
-    # CRITICAL FIX: ordinary columns, never MultiIndex.
     report = pd.DataFrame({"Name of Nurses": investigators})
 
     for t in TOOL_ORDER:
@@ -381,7 +406,8 @@ def source_sheet_name(filename):
 
 
 def raw_for_export(frame):
-    return frame.drop(columns=[c for c in frame.columns if str(c).startswith("__")], errors="ignore")
+    out = frame.drop(columns=[c for c in frame.columns if str(c).startswith("__")], errors="ignore")
+    return flatten_columns(out)
 
 
 def sample_widths(df, max_rows=50, cap=35):
@@ -427,13 +453,9 @@ def create_state_workbook(state, frames, processing_log, output_folder, spoc_map
     output_path = output_folder / f"{safe_filename(state)}_Tool_Submission_Report_{report_date}.xlsx"
     logging.info("Starting workbook for %s", state)
 
-    nurse_df = build_nurse_wise(state_frames, investigators)
-    dh_df = build_dh_below_dh(state_frames, investigators)
-    summary_df = build_summary(state, state_frames, investigators, spoc_map)
-
-    assert not isinstance(dh_df.columns, pd.MultiIndex), (
-        "Internal error: DH report must not have MultiIndex columns"
-    )
+    nurse_df = flatten_columns(build_nurse_wise(state_frames, investigators))
+    dh_df = flatten_columns(build_dh_below_dh(state_frames, investigators))
+    summary_df = flatten_columns(build_summary(state, state_frames, investigators, spoc_map))
 
     with pd.ExcelWriter(
         output_path,
@@ -453,6 +475,11 @@ def create_state_workbook(state, frames, processing_log, output_folder, spoc_map
         )
         tf = wb.add_format({"bold": True, "bg_color": "#B7DEE8", "border": 1})
         title = wb.add_format({"bold": True, "font_size": 14, "bottom": 1})
+
+        # Safety guard (again) just before writing.
+        nurse_df = flatten_columns(nurse_df)
+        dh_df = flatten_columns(dh_df)
+        summary_df = flatten_columns(summary_df)
 
         nurse_df.to_excel(writer, sheet_name="Nurse Wise", index=False)
         format_sheet(writer.sheets["Nurse Wise"], nurse_df, hf, tf, 0, (1, 1), 32)
@@ -482,7 +509,7 @@ def create_state_workbook(state, frames, processing_log, output_folder, spoc_map
             raw.to_excel(writer, sheet_name=sn, index=False)
             format_sheet(writer.sheets[sn], raw, hf, None, 0, (1, 0), 24)
 
-        state_log = processing_log.assign(State_Workbook=state)
+        state_log = flatten_columns(processing_log.assign(State_Workbook=state))
         state_log.to_excel(writer, sheet_name="Processing Log", index=False)
         format_sheet(writer.sheets["Processing Log"], state_log, hf, None, 0, (1, 0), 45)
 
