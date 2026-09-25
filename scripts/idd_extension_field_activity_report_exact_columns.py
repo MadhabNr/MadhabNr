@@ -1,9 +1,20 @@
 #!/usr/bin/env python3
-"""All-state cumulative IDD Extension reports with latest-vs-previous cumulative comparison."""
-import io, json, logging, math, os, re, smtplib, ssl, sys, zipfile
+"""Cumulative IDD Extension FI and AWC reporting for all states."""
+
+import io
+import json
+import logging
+import math
+import os
+import re
+import smtplib
+import ssl
+import sys
+import zipfile
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
+
 import numpy as np
 import pandas as pd
 from google.oauth2.service_account import Credentials
@@ -11,20 +22,29 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
-SCRIPT_VERSION = "2026-09-25-idd-cumulative-latest-vs-previous-v7"
+SCRIPT_VERSION = "2026-09-25-idd-cumulative-awc-v8"
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+WEEKLY_TRAVEL_KM = float(os.getenv("WEEKLY_TRAVEL_KM", "10"))
+
 TOOLS = [
     ("Mother 0-5", "IDD_Extension_Mother_0_5_WIDE.xlsx", "Qgeo-Latitude", "Qgeo-Longitude"),
     ("Mother 6-11", "IDD Extension Mother 6-11_WIDE.xlsx", "QX1-Latitude", "QX1-Longitude"),
     ("Separate CD", "IDD_Extension_Separate_CD_Tool_WIDE.xlsx", "Qgeo-Latitude", "Qgeo-Longitude"),
 ]
-TOOL_NAMES = [x[0] for x in TOOLS]
+TOOL_NAMES = [tool for tool, _, _, _ in TOOLS]
+
 ALIASES = {
     "state": ["STATE", "State", "state", "Cal_STATE", "state_name"],
     "fi": ["QDC_Name", "QDC Name", "Field Investigator Name", "Investigator", "QDC", "collector_name"],
-    "date": ["SubmissionDate", "Submission Date", "submission_date", "SubmissionDateTime", "Submission_Time", "endtime", "EndTime", "starttime", "StartTime"],
+    "date": [
+        "SubmissionDate", "Submission Date", "submission_date", "SubmissionDateTime",
+        "Submission_Time", "endtime", "EndTime", "starttime", "StartTime",
+    ],
+    "awc_calculated": ["Cal_AWC"],
+    "awc_given": ["QAWC_code"],
+    "awc_current": ["QAWC_3"],
+    "awc_name": ["QAWC_name"],
 }
-TRAVEL_KM = float(os.getenv("WEEKLY_TRAVEL_KM", "10"))
 
 
 def env(*names, required=False):
@@ -42,15 +62,20 @@ def norm(value):
 
 
 def clean(series):
-    return series.astype("string").str.strip().replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "<NA>": pd.NA})
+    return series.astype("string").str.strip().replace(
+        {"": pd.NA, "nan": pd.NA, "None": pd.NA, "<NA>": pd.NA}
+    )
 
 
 def find_col(columns, aliases):
-    lookup = {norm(c): str(c) for c in columns}
-    return next((lookup[norm(a)] for a in aliases if norm(a) in lookup), None)
+    lookup = {norm(column): str(column) for column in columns}
+    for alias in aliases:
+        if norm(alias) in lookup:
+            return lookup[norm(alias)]
+    return None
 
 
-def creds():
+def credentials():
     raw = env("GOOGLE_SERVICE_ACCOUNT_JSON")
     path = env("GOOGLE_SERVICE_ACCOUNT_FILE") or "credential.json"
     if raw:
@@ -60,121 +85,156 @@ def creds():
     raise ValueError("Google service account credentials not found")
 
 
-def drive_id(service, folder_id, filename):
+def drive_file_id(service, folder_id, filename):
     safe = filename.replace("\\", "\\\\").replace("'", "\\'")
     query = f"'{folder_id}' in parents and trashed = false and name = '{safe}'"
-    files = service.files().list(q=query, spaces="drive", fields="files(id,name)", pageSize=10).execute().get("files", [])
+    files = service.files().list(
+        q=query, spaces="drive", fields="files(id,name)", pageSize=10
+    ).execute().get("files", [])
     if not files:
-        raise FileNotFoundError(filename)
+        raise FileNotFoundError(f"File not found: {filename}")
     return files[0]["id"]
 
 
 def download(service, file_id):
     buffer = io.BytesIO()
-    job = MediaIoBaseDownload(buffer, service.files().get_media(fileId=file_id))
+    downloader = MediaIoBaseDownload(buffer, service.files().get_media(fileId=file_id))
     done = False
     while not done:
-        _, done = job.next_chunk()
+        _, done = downloader.next_chunk()
     return buffer.getvalue()
 
 
 def read_excel(data, filename):
     preview = pd.read_excel(io.BytesIO(data), sheet_name=0, header=None, nrows=25, engine="openpyxl")
     targets = {norm("STATE"), norm("QDC_Name")}
-    best = max(
-        ((len({norm(v) for v in preview.iloc[i].tolist() if pd.notna(v)} & targets), i) for i in range(len(preview))),
-        default=(0, 0),
-    )[1]
-    df = pd.read_excel(io.BytesIO(data), sheet_name=0, header=best, engine="openpyxl")
-    df.columns = [str(c).strip() for c in df.columns]
-    logging.info("%s: header row %s, %s rows x %s columns", filename, best + 1, len(df), len(df.columns))
-    return df, best + 1
+    best_row, best_score = 0, -1
+    for row_number in range(len(preview)):
+        values = {norm(v) for v in preview.iloc[row_number].tolist() if pd.notna(v)}
+        score = len(values & targets)
+        if score > best_score:
+            best_row, best_score = row_number, score
+    frame = pd.read_excel(io.BytesIO(data), sheet_name=0, header=best_row, engine="openpyxl")
+    frame.columns = [str(column).strip() for column in frame.columns]
+    logging.info("%s: header row %s, %s rows x %s columns", filename, best_row + 1, len(frame), len(frame.columns))
+    return frame, best_row + 1
 
 
 def parse_dates(series):
     text = clean(series)
     parsed = pd.to_datetime(text, format="ISO8601", errors="coerce")
-    missing = parsed.isna() & text.notna()
-    if missing.any():
+    unresolved = parsed.isna() & text.notna()
+    if unresolved.any():
         try:
-            parsed.loc[missing] = pd.to_datetime(text.loc[missing], format="mixed", dayfirst=True, errors="coerce")
+            parsed.loc[unresolved] = pd.to_datetime(
+                text.loc[unresolved], format="mixed", dayfirst=True, errors="coerce"
+            )
         except (TypeError, ValueError):
-            parsed.loc[missing] = pd.to_datetime(text.loc[missing], dayfirst=True, errors="coerce")
+            parsed.loc[unresolved] = pd.to_datetime(
+                text.loc[unresolved], dayfirst=True, errors="coerce"
+            )
     return parsed
 
 
+def combine_awc_identifier(frame, detected):
+    """Priority: Cal_AWC, current QAWC_3, given QAWC_code, then normalized QAWC_name."""
+    result = pd.Series(pd.NA, index=frame.index, dtype="string")
+    for key in ("awc_calculated", "awc_current", "awc_given", "awc_name"):
+        column = detected.get(key)
+        if column:
+            candidate = clean(frame[column])
+            result = result.fillna(candidate)
+    result = result.str.replace(r"\.0$", "", regex=True).str.strip().str.casefold()
+    return result
+
+
 def standardize(raw, tool, filename, lat_name, lon_name, header_row):
-    state_col = find_col(raw.columns, ALIASES["state"])
-    fi_col = find_col(raw.columns, ALIASES["fi"])
-    date_col = find_col(raw.columns, ALIASES["date"])
+    detected = {key: find_col(raw.columns, aliases) for key, aliases in ALIASES.items()}
     lat_col = find_col(raw.columns, [lat_name])
     lon_col = find_col(raw.columns, [lon_name])
-    missing = [label for label, col in [("STATE", state_col), ("QDC_Name", fi_col), ("date", date_col), (lat_name, lat_col), (lon_name, lon_col)] if not col]
+    required = {
+        "STATE": detected["state"], "QDC_Name": detected["fi"],
+        "submission date/time": detected["date"], lat_name: lat_col, lon_name: lon_col,
+    }
+    missing = [label for label, column in required.items() if not column]
     if missing:
         raise ValueError(f"{filename}: missing {', '.join(missing)}")
-    df = raw.copy()
-    df["__Tool"] = tool
-    df["__State"] = clean(df[state_col])
-    df["__FI"] = clean(df[fi_col])
-    df["__FIKey"] = df["__FI"].str.casefold()
-    df["__DateTime"] = parse_dates(df[date_col])
-    df["__Date"] = df["__DateTime"].dt.normalize()
-    df["__Latitude"] = pd.to_numeric(df[lat_col], errors="coerce").where(lambda s: s.between(-90, 90))
-    df["__Longitude"] = pd.to_numeric(df[lon_col], errors="coerce").where(lambda s: s.between(-180, 180))
-    return df, {
+    if not any(detected[key] for key in ("awc_calculated", "awc_current", "awc_given", "awc_name")):
+        raise ValueError(f"{filename}: no AWC identifier found; expected Cal_AWC, QAWC_code, QAWC_3 or QAWC_name")
+
+    frame = raw.copy()
+    frame["__Tool"] = tool
+    frame["__State"] = clean(frame[detected["state"]])
+    frame["__FI"] = clean(frame[detected["fi"]])
+    frame["__FIKey"] = frame["__FI"].str.casefold()
+    frame["__DateTime"] = parse_dates(frame[detected["date"]])
+    frame["__Date"] = frame["__DateTime"].dt.normalize()
+    frame["__AWCKey"] = combine_awc_identifier(frame, detected)
+    frame["__Latitude"] = pd.to_numeric(frame[lat_col], errors="coerce").where(lambda s: s.between(-90, 90))
+    frame["__Longitude"] = pd.to_numeric(frame[lon_col], errors="coerce").where(lambda s: s.between(-180, 180))
+
+    return frame, {
         "Tool": tool, "File": filename, "Header Row": header_row, "Rows Read": len(raw),
-        "State Column": state_col, "FI Column": fi_col, "Submission Column": date_col,
-        "Latitude Column": lat_col, "Longitude Column": lon_col,
-        "Unique FIs": int(df["__FIKey"].nunique()), "Valid Dates": int(df["__Date"].notna().sum()),
-        "Start Date Found": df["__Date"].min(), "Latest Date Found": df["__Date"].max(),
+        "State Column": detected["state"], "FI Column": detected["fi"],
+        "Submission Column": detected["date"], "Latitude Column": lat_col,
+        "Longitude Column": lon_col,
+        "Cal AWC Column": detected["awc_calculated"] or "",
+        "Current AWC Column": detected["awc_current"] or "",
+        "Given AWC Column": detected["awc_given"] or "",
+        "AWC Name Column": detected["awc_name"] or "",
+        "Unique FIs": int(frame["__FIKey"].dropna().nunique()),
+        "Valid Dates": int(frame["__Date"].notna().sum()),
+        "Valid AWC Identifiers": int(frame["__AWCKey"].notna().sum()),
+        "Start Date Found": frame["__Date"].min(),
+        "Latest Date Found": frame["__Date"].max(),
         "Status": "OK",
     }
 
 
 def load_all(service, folder_id):
     frames, logs = {}, []
-    for tool, filename, lat, lon in TOOLS:
+    for tool, filename, lat_name, lon_name in TOOLS:
         logging.info("Reading %s", filename)
         try:
-            raw, header = read_excel(download(service, drive_id(service, folder_id, filename)), filename)
-            frames[tool], log = standardize(raw, tool, filename, lat, lon, header)
+            raw, header_row = read_excel(download(service, drive_file_id(service, folder_id, filename)), filename)
+            frames[tool], log = standardize(raw, tool, filename, lat_name, lon_name, header_row)
             logs.append(log)
         except Exception as exc:
             logging.exception("Could not process %s", filename)
             logs.append({"Tool": tool, "File": filename, "Rows Read": 0, "Status": f"ERROR: {exc}"})
     missing = sorted(set(TOOL_NAMES) - set(frames))
     if missing:
-        raise ValueError("Stopped because tools failed: " + ", ".join(missing))
+        raise ValueError("Report stopped because tools failed: " + ", ".join(missing))
     return frames, pd.DataFrame(logs)
 
 
-def states(frames):
+def get_states(frames):
     groups = {}
-    for df in frames.values():
-        for value in df["__State"].dropna().unique():
+    for frame in frames.values():
+        for value in frame["__State"].dropna().unique():
             display = str(value).strip()
             if display:
                 groups.setdefault(display.casefold(), []).append(display)
-    values = [max(v, key=lambda x: (v.count(x), len(x))) for v in groups.values()]
+    states = [max(values, key=lambda x: (values.count(x), len(x))) for values in groups.values()]
     selected = {x.strip().casefold() for x in env("STATES").split(",") if x.strip()}
     excluded = {x.strip().casefold() for x in env("EXCLUDED_STATES").split(",") if x.strip()}
     if selected:
-        values = [x for x in values if x.casefold() in selected]
-    return sorted([x for x in values if x.casefold() not in excluded], key=str.casefold)
+        states = [state for state in states if state.casefold() in selected]
+    return sorted([state for state in states if state.casefold() not in excluded], key=str.casefold)
 
 
-def state_frame(frames, state):
+def state_data(frames, state):
     return pd.concat([
-        df.loc[df["__State"].fillna("").str.strip().str.casefold() == state.casefold()].copy()
-        for df in frames.values()
+        frame.loc[frame["__State"].fillna("").str.strip().str.casefold() == state.casefold()].copy()
+        for frame in frames.values()
     ], ignore_index=True, sort=False)
 
 
-def roster(data):
+def fi_roster(data):
     valid = data.dropna(subset=["__FIKey", "__FI"])
     return (
-        valid.groupby(["__FIKey", "__FI"]).size().rename("n").reset_index()
-        .sort_values(["__FIKey", "n", "__FI"], ascending=[True, False, True])
+        valid.groupby(["__FIKey", "__FI"]).size().rename("Records").reset_index()
+        .sort_values(["__FIKey", "Records", "__FI"], ascending=[True, False, True])
         .drop_duplicates("__FIKey")[["__FIKey", "__FI"]]
         .rename(columns={"__FI": "Name of Field Investigators"})
     )
@@ -183,207 +243,277 @@ def roster(data):
 def report_dates(data):
     dates = data["__Date"].dropna()
     if dates.empty:
-        raise ValueError("No valid dates")
+        raise ValueError("No valid dates found")
     latest = dates.max()
     return latest, latest - pd.Timedelta(days=1)
 
 
-def cumulative_matrix(data, through_date, fi_roster):
+def cumulative_submission_matrix(data, through_date, roster):
     selected = data.loc[data["__Date"].notna() & (data["__Date"] <= through_date)]
     counts = selected.groupby(["__FIKey", "__Tool"]).size().unstack(fill_value=0)
-    counts = counts.reindex(index=fi_roster["__FIKey"], columns=TOOL_NAMES, fill_value=0)
-    counts.index.name = "__FIKey"
-    result = fi_roster.merge(counts.reset_index(), on="__FIKey", how="left")
+    counts = counts.reindex(index=roster["__FIKey"], columns=TOOL_NAMES, fill_value=0)
+    result = roster.merge(counts.reset_index(), on="__FIKey", how="left")
     for tool in TOOL_NAMES:
         result[tool] = result[tool].fillna(0).astype(int)
-    result["Total Submissions"] = result[TOOL_NAMES].sum(axis=1).astype(int)
+    result["Total Interviews"] = result[TOOL_NAMES].sum(axis=1).astype(int)
     return result
 
 
-def cumulative_fi_status(data, latest):
-    r = cumulative_matrix(data, latest, roster(data)).drop(columns="__FIKey")
-    r = r.sort_values("Name of Field Investigators", key=lambda s: s.str.casefold()).reset_index(drop=True)
-    total = {"Name of Field Investigators": "Total Submissions", **{t: int(r[t].sum()) for t in TOOL_NAMES}, "Total Submissions": int(r["Total Submissions"].sum())}
-    return pd.concat([r, pd.DataFrame([total])], ignore_index=True)
+def awc_metrics(data, through_date, roster):
+    selected = data.loc[
+        data["__Date"].notna() & (data["__Date"] <= through_date)
+        & data["__FIKey"].notna() & data["__AWCKey"].notna()
+    ].copy()
+    base = roster.set_index("__FIKey")
+    if selected.empty:
+        base["Unique AWCs Visited"] = 0
+        base["AWCs with At Least 2 Interviews"] = 0
+        base["AWCs with Both Mother Interviews"] = 0
+        return base.reset_index()
+
+    unique_awc = selected.groupby("__FIKey")["__AWCKey"].nunique()
+    awc_record_counts = selected.groupby(["__FIKey", "__AWCKey"]).size()
+    two_interviews = awc_record_counts.ge(2).groupby(level=0).sum()
+
+    mother = selected.loc[selected["__Tool"].isin(["Mother 0-5", "Mother 6-11"])]
+    mother_pair = mother.groupby(["__FIKey", "__AWCKey"])["__Tool"].nunique().eq(2)
+    both_mother = mother_pair.groupby(level=0).sum()
+
+    base["Unique AWCs Visited"] = unique_awc.reindex(base.index, fill_value=0).astype(int)
+    base["AWCs with At Least 2 Interviews"] = two_interviews.reindex(base.index, fill_value=0).astype(int)
+    base["AWCs with Both Mother Interviews"] = both_mother.reindex(base.index, fill_value=0).astype(int)
+    return base.reset_index()
 
 
-def cumulative_fi_change(data, latest, previous):
-    people = roster(data)
-    current = cumulative_matrix(data, latest, people).set_index("__FIKey")
-    prior = cumulative_matrix(data, previous, people).set_index("__FIKey")
-    out = people.set_index("__FIKey")
-    for tool in TOOL_NAMES:
-        out[f"Current {tool}"] = current[tool]
-        out[f"Previous {tool}"] = prior[tool]
-    out["Current Total"] = current["Total Submissions"]
-    out["Previous Total"] = prior["Total Submissions"]
-    out["Change"] = out["Current Total"] - out["Previous Total"]
-    out["% Change"] = np.where(out["Previous Total"] > 0, out["Change"] / out["Previous Total"], np.where(out["Current Total"] == 0, 0.0, np.nan))
-    return out.reset_index(drop=True).sort_values("Name of Field Investigators", key=lambda s: s.str.casefold())
+def cumulative_status(data, latest):
+    roster = fi_roster(data)
+    submissions = cumulative_submission_matrix(data, latest, roster)
+    awc = awc_metrics(data, latest, roster).drop(columns="Name of Field Investigators")
+    result = submissions.merge(awc, on="__FIKey", how="left").drop(columns="__FIKey")
+    result = result.sort_values("Name of Field Investigators", key=lambda s: s.str.casefold()).reset_index(drop=True)
+    numeric = [*TOOL_NAMES, "Total Interviews", "Unique AWCs Visited", "AWCs with At Least 2 Interviews", "AWCs with Both Mother Interviews"]
+    total = {"Name of Field Investigators": "Total / Sum", **{column: int(result[column].sum()) for column in numeric}}
+    return pd.concat([result, pd.DataFrame([total])], ignore_index=True)
 
 
-def cumulative_tool_change(data, latest, previous):
+def cumulative_comparison(data, latest, previous):
+    roster = fi_roster(data)
+    current = cumulative_submission_matrix(data, latest, roster).set_index("__FIKey")
+    prior = cumulative_submission_matrix(data, previous, roster).set_index("__FIKey")
+    current_awc = awc_metrics(data, latest, roster).set_index("__FIKey")
+    prior_awc = awc_metrics(data, previous, roster).set_index("__FIKey")
+    result = roster.set_index("__FIKey")
+    result["Current Total Interviews"] = current["Total Interviews"]
+    result["Previous Total Interviews"] = prior["Total Interviews"]
+    result["Interview Change"] = result["Current Total Interviews"] - result["Previous Total Interviews"]
+    result["Interview % Change"] = np.where(
+        result["Previous Total Interviews"] > 0,
+        result["Interview Change"] / result["Previous Total Interviews"],
+        np.where(result["Current Total Interviews"] == 0, 0.0, np.nan),
+    )
+    for metric in ("Unique AWCs Visited", "AWCs with At Least 2 Interviews", "AWCs with Both Mother Interviews"):
+        result[f"Current {metric}"] = current_awc[metric]
+        result[f"Previous {metric}"] = prior_awc[metric]
+        result[f"Change in {metric}"] = current_awc[metric] - prior_awc[metric]
+    return result.reset_index(drop=True).sort_values("Name of Field Investigators", key=lambda s: s.str.casefold())
+
+
+def tool_comparison(data, latest, previous):
     rows = []
     for tool in TOOL_NAMES:
-        d = data.loc[(data["__Tool"] == tool) & data["__Date"].notna()]
-        start = d["__Date"].min() if not d.empty else pd.NaT
-        current = int((d["__Date"] <= latest).sum())
-        prior = int((d["__Date"] <= previous).sum())
+        tool_data = data.loc[(data["__Tool"] == tool) & data["__Date"].notna()]
+        current = int((tool_data["__Date"] <= latest).sum())
+        prior = int((tool_data["__Date"] <= previous).sum())
         change = current - prior
         rows.append({
-            "Tool": tool, "Start Date Found": start,
+            "Tool": tool,
+            "Start Date Found": tool_data["__Date"].min() if not tool_data.empty else pd.NaT,
             f"Cumulative Through {latest:%d-%m-%Y}": current,
             f"Cumulative Through {previous:%d-%m-%Y}": prior,
-            "Change": change, "% Change": change / prior if prior else (0.0 if current == 0 else np.nan),
+            "Change": change,
+            "% Change": change / prior if prior else (0.0 if current == 0 else np.nan),
         })
     return pd.DataFrame(rows)
 
 
-def haversine(a, b, c, d):
-    if any(pd.isna(x) for x in (a, b, c, d)):
+def haversine(lat1, lon1, lat2, lon2):
+    if any(pd.isna(v) for v in (lat1, lon1, lat2, lon2)):
         return np.nan
-    r = 6371.0088
-    p1, p2, dp, dl = map(math.radians, (a, c, c - a, d - b))
-    x = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
-    return r * 2 * math.atan2(math.sqrt(x), math.sqrt(1 - x))
+    radius = 6371.0088
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi, dlambda = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    return radius * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def weekly_travel(data):
     gps = data.dropna(subset=["__FIKey", "__Date", "__Latitude", "__Longitude"]).copy()
     if gps.empty:
         return pd.DataFrame()
-    daily = gps.groupby(["__FIKey", "__Date"], as_index=False).agg(Lat=("__Latitude", "median"), Lon=("__Longitude", "median")).sort_values(["__FIKey", "__Date"])
-    daily["PrevLat"] = daily.groupby("__FIKey")["Lat"].shift()
-    daily["PrevLon"] = daily.groupby("__FIKey")["Lon"].shift()
-    daily["Distance km"] = daily.apply(lambda x: haversine(x.PrevLat, x.PrevLon, x.Lat, x.Lon), axis=1)
+    daily = gps.groupby(["__FIKey", "__Date"], as_index=False).agg(
+        Latitude=("__Latitude", "median"), Longitude=("__Longitude", "median")
+    ).sort_values(["__FIKey", "__Date"])
+    daily["Previous Latitude"] = daily.groupby("__FIKey")["Latitude"].shift()
+    daily["Previous Longitude"] = daily.groupby("__FIKey")["Longitude"].shift()
+    daily["Distance km"] = daily.apply(
+        lambda row: haversine(row["Previous Latitude"], row["Previous Longitude"], row["Latitude"], row["Longitude"]), axis=1
+    )
     iso = daily["__Date"].dt.isocalendar()
     daily["ISO Year"], daily["ISO Week"] = iso.year.astype(int), iso.week.astype(int)
     daily["Week Start"] = daily["__Date"] - pd.to_timedelta(daily["__Date"].dt.weekday, unit="D")
-    fi = daily.groupby(["__FIKey", "ISO Year", "ISO Week", "Week Start"], as_index=False).agg(Weekly_km=("Distance km", "sum"), Comparisons=("Distance km", "count"))
-    fi = fi.loc[fi.Comparisons > 0].copy()
-    if fi.empty:
+    fi_week = daily.groupby(["__FIKey", "ISO Year", "ISO Week", "Week Start"], as_index=False).agg(
+        Weekly_Travel_km=("Distance km", "sum"), Comparisons=("Distance km", "count")
+    )
+    fi_week = fi_week.loc[fi_week["Comparisons"] > 0].copy()
+    if fi_week.empty:
         return pd.DataFrame()
-    fi["Reached"] = fi.Weekly_km >= TRAVEL_KM
-    out = fi.groupby(["ISO Year", "ISO Week", "Week Start"], as_index=False).agg(**{"FIs with Valid GPS Comparisons": ("__FIKey", "nunique"), "FIs Travelled At Least 10 km": ("Reached", "sum")})
-    out["Percent FIs Travelled >= 10 km"] = out["FIs Travelled At Least 10 km"] / out["FIs with Valid GPS Comparisons"]
-    return out.sort_values("Week Start", ascending=False)
+    fi_week["Reached 10 km"] = fi_week["Weekly_Travel_km"] >= WEEKLY_TRAVEL_KM
+    result = fi_week.groupby(["ISO Year", "ISO Week", "Week Start"], as_index=False).agg(
+        **{
+            "FIs with Valid GPS Comparisons": ("__FIKey", "nunique"),
+            "FIs Travelled At Least 10 km": ("Reached 10 km", "sum"),
+        }
+    )
+    result["Percent FIs Travelled >= 10 km"] = result["FIs Travelled At Least 10 km"] / result["FIs with Valid GPS Comparisons"]
+    return result.sort_values("Week Start", ascending=False)
 
 
 def safe(value):
     return re.sub(r'[<>:"/\\|?*]+', "_", str(value)).strip() or "Unknown_State"
 
 
-def format_sheet(writer, name, df, title=None, dates=None, percents=None, zeros=None):
+def format_sheet(writer, name, df, title=None, date_columns=None, percent_columns=None, zero_columns=None):
     ws, wb = writer.sheets[name], writer.book
-    row = 2 if title else 0
-    hf = wb.add_format({"bold": True, "bg_color": "#B7DEE8", "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True})
-    tf = wb.add_format({"bold": True, "font_size": 14})
-    dfmt, pfmt, zfmt = wb.add_format({"num_format": "dd-mm-yyyy"}), wb.add_format({"num_format": "+0.0%;-0.0%;-"}), wb.add_format({"bg_color": "#F4CCCC"})
+    header_row = 2 if title else 0
+    header = wb.add_format({"bold": True, "bg_color": "#B7DEE8", "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True})
+    title_format = wb.add_format({"bold": True, "font_size": 14})
+    date_format = wb.add_format({"num_format": "dd-mm-yyyy"})
+    percent_format = wb.add_format({"num_format": "+0.0%;-0.0%;-"})
+    zero_format = wb.add_format({"bg_color": "#F4CCCC"})
     if title:
-        ws.write(0, 0, title, tf)
-    ws.set_row(row, 38, hf)
-    ws.freeze_panes(row + 1, 1)
+        ws.write(0, 0, title, title_format)
+    ws.set_row(header_row, 38, header)
+    ws.freeze_panes(header_row + 1, 1)
     if len(df.columns):
-        ws.autofilter(row, 0, row + len(df), len(df.columns) - 1)
-    for i, col in enumerate(df.columns):
-        lengths = df.head(100)[col].dropna().astype(str).str.len()
-        width = min(max(len(str(col)) + 2, int(lengths.max()) + 2 if not lengths.empty else 10), 35)
-        fmt = dfmt if dates and col in dates else pfmt if percents and col in percents else None
-        ws.set_column(i, i, width, fmt)
-        if zeros and col in zeros and len(df):
-            ws.conditional_format(row + 1, i, row + len(df), i, {"type": "cell", "criteria": "==", "value": 0, "format": zfmt})
+        ws.autofilter(header_row, 0, header_row + len(df), len(df.columns) - 1)
+    for index, column in enumerate(df.columns):
+        lengths = df.head(100)[column].dropna().astype(str).str.len()
+        width = min(max(len(str(column)) + 2, int(lengths.max()) + 2 if not lengths.empty else 10), 38)
+        fmt = date_format if date_columns and column in date_columns else percent_format if percent_columns and column in percent_columns else None
+        ws.set_column(index, index, width, fmt)
+        if zero_columns and column in zero_columns and len(df):
+            ws.conditional_format(header_row + 1, index, header_row + len(df), index, {"type": "cell", "criteria": "==", "value": 0, "format": zero_format})
 
 
-def workbook(state, data, logs, output):
+def create_workbook(state, data, logs, output_dir):
     latest, previous = report_dates(data)
-    status = cumulative_fi_status(data, latest)
-    fi_change = cumulative_fi_change(data, latest, previous)
-    tool_change = cumulative_tool_change(data, latest, previous)
+    status = cumulative_status(data, latest)
+    comparison = cumulative_comparison(data, latest, previous)
+    tool_summary = tool_comparison(data, latest, previous)
     travel = weekly_travel(data)
-    logging.info("%s: latest database date=%s, previous date=%s, FI roster=%s", state, latest.date(), previous.date(), len(status) - 1)
-    output.mkdir(parents=True, exist_ok=True)
-    path = output / f"{safe(state).upper()}_IDD_Extension_Cumulative_Summary_{datetime.now():%d-%m-%Y}.xlsx"
-    with pd.ExcelWriter(path, engine="xlsxwriter", engine_kwargs={"options": {"strings_to_urls": False}}) as w:
-        status.to_excel(w, sheet_name="Cumulative FI Status", index=False, startrow=2)
-        format_sheet(w, "Cumulative FI Status", status, f"Cumulative submissions through latest database date: {latest:%d-%m-%Y} | {state}", zeros=set(TOOL_NAMES))
-        fi_change.to_excel(w, sheet_name="FI Cumulative Comparison", index=False, startrow=2)
-        format_sheet(w, "FI Cumulative Comparison", fi_change, f"FI cumulative totals through {latest:%d-%m-%Y} vs {previous:%d-%m-%Y} | {state}", percents={"% Change"})
-        tool_change.to_excel(w, sheet_name="Tool Cumulative Comparison", index=False, startrow=2)
-        format_sheet(w, "Tool Cumulative Comparison", tool_change, f"Tool cumulative totals through {latest:%d-%m-%Y} vs {previous:%d-%m-%Y} | {state}", dates={"Start Date Found"}, percents={"% Change"})
-        travel.to_excel(w, sheet_name="Weekly 10km Travel", index=False)
-        format_sheet(w, "Weekly 10km Travel", travel, dates={"Week Start"}, percents={"Percent FIs Travelled >= 10 km"})
-        log = logs.assign(State_Workbook=state, Latest_Database_Date=latest, Previous_Date=previous, FI_Roster_Count=len(status) - 1)
-        log.to_excel(w, sheet_name="Processing Log", index=False)
-        format_sheet(w, "Processing Log", log, dates={"Start Date Found", "Latest Date Found", "Latest_Database_Date", "Previous_Date"})
+    logging.info("%s: cumulative through %s; previous through %s; FI roster=%s", state, latest.date(), previous.date(), len(status) - 1)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"{safe(state).upper()}_IDD_Extension_Cumulative_AWC_Summary_{datetime.now():%d-%m-%Y}.xlsx"
+    with pd.ExcelWriter(path, engine="xlsxwriter", engine_kwargs={"options": {"strings_to_urls": False}}) as writer:
+        status.to_excel(writer, sheet_name="Cumulative FI and AWC", index=False, startrow=2)
+        format_sheet(
+            writer, "Cumulative FI and AWC", status,
+            title=f"Cumulative FI submissions and AWC coverage through latest database date: {latest:%d-%m-%Y} | {state}",
+            zero_columns=set(TOOL_NAMES),
+        )
+        comparison.to_excel(writer, sheet_name="Cumulative Comparison", index=False, startrow=2)
+        format_sheet(
+            writer, "Cumulative Comparison", comparison,
+            title=f"Cumulative totals through {latest:%d-%m-%Y} compared with {previous:%d-%m-%Y} | {state}",
+            percent_columns={"Interview % Change"},
+        )
+        tool_summary.to_excel(writer, sheet_name="Tool Cumulative Comparison", index=False, startrow=2)
+        format_sheet(
+            writer, "Tool Cumulative Comparison", tool_summary,
+            title=f"Tool cumulative totals through {latest:%d-%m-%Y} compared with {previous:%d-%m-%Y} | {state}",
+            date_columns={"Start Date Found"}, percent_columns={"% Change"},
+        )
+        travel.to_excel(writer, sheet_name="Weekly 10km Travel", index=False)
+        format_sheet(writer, "Weekly 10km Travel", travel, date_columns={"Week Start"}, percent_columns={"Percent FIs Travelled >= 10 km"})
+        process = logs.assign(State_Workbook=state, Latest_Database_Date=latest, Previous_Date=previous, FI_Roster_Count=len(status) - 1)
+        process.to_excel(writer, sheet_name="Processing Log", index=False)
+        format_sheet(writer, "Processing Log", process, date_columns={"Start Date Found", "Latest Date Found", "Latest_Database_Date", "Previous_Date"})
         for tool in TOOL_NAMES:
-            raw = data.loc[data.__Tool == tool].drop(columns=[c for c in data.columns if str(c).startswith("__")], errors="ignore")
+            raw = data.loc[data["__Tool"] == tool].drop(columns=[c for c in data.columns if str(c).startswith("__")], errors="ignore")
             name = re.sub(r"[\\/*?:\[\]]", "_", f"Raw {tool}")[:31]
-            raw.to_excel(w, sheet_name=name, index=False)
-            format_sheet(w, name, raw)
+            raw.to_excel(writer, sheet_name=name, index=False)
+            format_sheet(writer, name, raw)
+    logging.info("Created workbook: %s", path)
     return path
 
 
-def make_zip(paths, output):
-    path = output / f"IDD_Extension_Cumulative_Summary_All_States_{datetime.now():%d-%m-%Y}.zip"
-    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+def make_zip(paths, output_dir):
+    path = output_dir / f"IDD_Extension_Cumulative_AWC_Summary_All_States_{datetime.now():%d-%m-%Y}.zip"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         for item in paths:
-            z.write(item, arcname=item.name)
+            archive.write(item, arcname=item.name)
     return path
 
 
-def send(attachment, state_names):
+def send_email(attachment, state_names):
     sender = env("SMTP_EMAIL", "GMAIL_USERNAME", required=True)
     password = env("SMTP_APP_PASSWORD", "GMAIL_APP_PASSWORD", required=True)
     recipients = [x.strip() for x in re.split(r"[,;]", env("RECIPIENTS", "REPORT_RECIPIENTS", required=True)) if x.strip()]
-    size = attachment.stat().st_size / (1024 * 1024)
-    limit = float(env("MAX_EMAIL_ATTACHMENT_MB") or "24")
-    if size > limit:
-        raise ValueError(f"ZIP is {size:.2f} MB, above {limit:.2f} MB")
-    msg = EmailMessage()
-    msg["From"], msg["To"] = sender, ", ".join(recipients)
-    msg["Subject"] = env("MAIL_SUBJECT") or f"IDD Extension Cumulative Summary - {datetime.now():%d-%m-%Y}"
-    msg.set_content(f"Dear Team,\n\nPlease find attached the cumulative IDD Extension report for: {', '.join(state_names)}.\n\nRegards,\nGAVB Reporting Automation")
-    with attachment.open("rb") as f:
-        msg.add_attachment(f.read(), maintype="application", subtype="zip", filename=attachment.name)
+    size_mb = attachment.stat().st_size / (1024 * 1024)
+    limit_mb = float(env("MAX_EMAIL_ATTACHMENT_MB") or "24")
+    if size_mb > limit_mb:
+        raise ValueError(f"ZIP is {size_mb:.2f} MB, above {limit_mb:.2f} MB")
+    message = EmailMessage()
+    message["From"], message["To"] = sender, ", ".join(recipients)
+    message["Subject"] = env("MAIL_SUBJECT") or f"IDD Extension Cumulative AWC Summary - {datetime.now():%d-%m-%Y}"
+    message.set_content(f"Dear Team,\n\nPlease find attached the cumulative IDD Extension FI and AWC summary for: {', '.join(state_names)}.\n\nRegards,\nGAVB Reporting Automation")
+    with attachment.open("rb") as handle:
+        message.add_attachment(handle.read(), maintype="application", subtype="zip", filename=attachment.name)
     with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ssl.create_default_context(), timeout=60) as smtp:
         smtp.login(sender, password)
-        smtp.send_message(msg)
+        smtp.send_message(message)
+    logging.info("Email sent successfully")
 
 
 def main():
     logging.basicConfig(level=(env("LOG_LEVEL") or "INFO").upper(), format="%(asctime)s [%(levelname)s] %(message)s")
     try:
         logging.info("Running report script version: %s", SCRIPT_VERSION)
-        output = Path(env("LOCAL_OUTPUT_FOLDER") or f"/tmp/{datetime.now(timezone.utc):%Y-%m-%d}/idd_extension_cumulative")
-        service = build("drive", "v3", credentials=creds(), cache_discovery=False)
+        output_dir = Path(env("LOCAL_OUTPUT_FOLDER") or f"/tmp/{datetime.now(timezone.utc):%Y-%m-%d}/idd_extension_cumulative_awc")
+        service = build("drive", "v3", credentials=credentials(), cache_discovery=False)
         frames, logs = load_all(service, env("DRIVE_FOLDER_ID", required=True))
-        report_paths, done = [], []
-        for state in states(frames):
-            data = state_frame(frames, state)
+        reports, completed = [], []
+        for state in get_states(frames):
+            data = state_data(frames, state)
             if not data.empty:
-                report_paths.append(workbook(state, data, logs, output))
-                done.append(state)
-        if not report_paths:
+                reports.append(create_workbook(state, data, logs, output_dir))
+                completed.append(state)
+        if not reports:
             raise ValueError("No reports created")
-        zipped = make_zip(report_paths, output)
-        send(zipped, done)
+        zip_path = make_zip(reports, output_dir)
+        send_email(zip_path, completed)
         print("Created reports:")
-        for item in report_paths:
-            print(" -", item)
-        print("Email attachment:", zipped)
+        for report in reports:
+            print(" -", report)
+        print("Email attachment:", zip_path)
         return 0
     except (ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
-        logging.error("Configuration/runtime error: %s", exc); return 2
+        logging.error("Configuration/runtime error: %s", exc)
+        return 2
     except HttpError as exc:
-        logging.error("Google API error: %s", exc); return 3
+        logging.error("Google API error: %s", exc)
+        return 3
     except smtplib.SMTPAuthenticationError:
-        logging.exception("Gmail authentication failed"); return 4
+        logging.exception("Gmail authentication failed")
+        return 4
     except (smtplib.SMTPException, OSError) as exc:
-        logging.exception("Email delivery failed: %s", exc); return 5
+        logging.exception("Email delivery failed: %s", exc)
+        return 5
     except Exception as exc:
-        logging.exception("Unexpected failure: %s", exc); return 1
+        logging.exception("Unexpected failure: %s", exc)
+        return 1
 
 
 if __name__ == "__main__":
     sys.exit(main())
-
