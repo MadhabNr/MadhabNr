@@ -1,78 +1,46 @@
 #!/usr/bin/env python3
-"""Create GAVB reports for every detected state and email them in one ZIP file."""
+"""IDD Extension submission summary for Mother 0-5, Mother 6-11, and Separate CD."""
 
-import io
-import json
-import logging
-import os
-import re
-import smtplib
-import ssl
-import sys
-import zipfile
+import io, json, logging, math, os, re, smtplib, ssl, sys, zipfile
 from datetime import datetime, timezone
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Optional, Sequence
 
+import numpy as np
 import pandas as pd
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaIoBaseDownload
 
-SCRIPT_VERSION = "2026-09-21-all-states-smtp-v3"
+SCRIPT_VERSION = "2026-09-25-idd-submission-summary-v4"
 DRIVE_SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+WEEKLY_TRAVEL_KM = float(os.getenv("WEEKLY_TRAVEL_KM", "10"))
 
-TOOLS = [
-    ("DOD", "DOD_2026_WIDE.csv"),
-    ("Maternal_Log", "Maternal Log_WIDE.csv"),
-    ("FIS", "FIS CASE RECORDS 2026_WIDE.csv"),
-    ("PMSMA", "PMSMA Client Interview_WIDE.csv"),
-    ("SNCU", "SNCU Index Cases Observation 2026_WIDE.csv"),
-    ("Referral_Services", "GABV IDD Referral_WIDE.csv"),
-    ("Digital_System", "GAVB IDD Digital System_WIDE.csv"),
-    ("Exit_Interview", "GAVB IDD Exit Interview_WIDE.csv"),
-    ("HR", "GAVB IDD HR_WIDE.csv"),
-    ("Labour_Room_Readiness", "GAVB IDD Labour Room Readiness_WIDE.csv"),
-    ("Supply_Chain", "GAVB IDD Supply Chain_WIDE.csv"),
+TOOL_FILES = [
+    ("Mother 0-5", "IDD_Extension_Mother_0_5_WIDE.xlsx"),
+    ("Mother 6-11", "IDD Extension Mother 6-11_WIDE.xlsx"),
+    ("Separate CD", "IDD_Extension_Separate_CD_Tool_WIDE.xlsx"),
 ]
 
-LABELS = {
-    "DOD": "DOD",
-    "Maternal_Log": "Maternal Log",
-    "FIS": "FIS",
-    "PMSMA": "PMSMA",
-    "SNCU": "SNCU",
-    "Referral_Services": "Referral Services",
-    "Digital_System": "Digital System",
-    "Exit_Interview": "Exit Interview",
-    "HR": "HR",
-    "Labour_Room_Readiness": "Labour Room Readiness",
-    "Supply_Chain": "Supply Chain",
-}
-
 ALIASES = {
-    "state": ["STATE", "State", "state", "Cal_STATE", "state_name"],
-    "investigator": [
-        "QDC", "Investigator", "Nurse", "Nurse_Name", "Nursing_Consultant",
-        "Name of Nursing Consultants", "Name of Nurses", "collector_name",
-    ],
-    "facility_type": ["F_Type", "Facility_Type", "Facility Type", "facilitytype"],
-    "facility_level": ["Facility_Level", "Facility Level", "Level", "DH_Below_DH"],
-    "submission_date": [
-        "SubmissionDate", "Submission Date", "submission_date", "SubmissionDateTime",
-        "Submission_Time", "starttime", "endtime",
-    ],
+    "state": ["STATE"],
+    "fi": ["QDC_Name"],
+    "submission": ["SubmissionDate", "Submission Date", "submission_date", "SubmissionDateTime", "Submission_Time", "endtime", "EndTime", "starttime", "StartTime"],
+    "awc_name": ["QAWC_name"],
+    "awc_code": ["Cal_AWC", "QAWC_code", "QAWC_3"],
+    "district": ["DIST"],
+    "block": ["BLOCK"],
 }
 
-DH_VALUES = {"dh", "district hospital", "district_hospital", "district hospital dh"}
-DAY_START_HOUR = 9
-DAY_END_HOUR = 18
-DEFAULT_STATE_SPOC = {"Assam": "Nikhil Kumar"}
+GPS_ALIASES = {
+    "Mother 0-5": (["Qgeo-Latitude"], ["Qgeo-Longitude"]),
+    "Mother 6-11": (["QX1-Latitude"], ["QX1-Longitude"]),
+    "Separate CD": (["Qgeo-Latitude"], ["Qgeo-Longitude"]),
+}
 
 
-def env(*names: str, required: bool = False) -> str:
+def env(*names, required=False):
     for name in names:
         value = os.getenv(name, "").strip()
         if value:
@@ -82,64 +50,45 @@ def env(*names: str, required: bool = False) -> str:
     return ""
 
 
-def normalize(value) -> str:
+def norm(value):
     return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
 
 
-def normalize_state(value) -> str:
-    return str(value).strip().casefold()
-
-
 def clean(series):
-    return series.astype("string").str.strip().replace({"": pd.NA, "nan": pd.NA, "None": pd.NA})
+    return series.astype("string").str.strip().replace({"": pd.NA, "nan": pd.NA, "None": pd.NA, "<NA>": pd.NA})
 
 
-def find_column(columns: Sequence[object], names: Sequence[str]) -> Optional[str]:
-    lookup = {normalize(column): str(column) for column in columns}
-    return next((lookup[normalize(name)] for name in names if normalize(name) in lookup), None)
+def find_column(columns, aliases):
+    lookup = {norm(column): str(column) for column in columns}
+    for alias in aliases:
+        if norm(alias) in lookup:
+            return lookup[norm(alias)]
+    return None
 
 
-def flatten(df: pd.DataFrame) -> pd.DataFrame:
-    result = df.copy()
-    if isinstance(result.columns, pd.MultiIndex):
-        result.columns = [
-            " | ".join(str(value).strip() for value in values if str(value).strip())
-            for values in result.columns.to_flat_index()
-        ]
-    else:
-        result.columns = [str(column) for column in result.columns]
-    return result
-
-
-def build_credentials() -> Credentials:
+def credentials():
     raw = env("GOOGLE_SERVICE_ACCOUNT_JSON")
-    file_path = env("GOOGLE_SERVICE_ACCOUNT_FILE") or "credential.json"
+    credential_file = env("GOOGLE_SERVICE_ACCOUNT_FILE") or "credential.json"
     if raw:
-        try:
-            info = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON") from exc
-        return Credentials.from_service_account_info(info, scopes=DRIVE_SCOPES)
-    if os.path.exists(file_path):
-        return Credentials.from_service_account_file(file_path, scopes=DRIVE_SCOPES)
+        return Credentials.from_service_account_info(json.loads(raw), scopes=DRIVE_SCOPES)
+    if os.path.exists(credential_file):
+        return Credentials.from_service_account_file(credential_file, scopes=DRIVE_SCOPES)
     raise ValueError("Set GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_FILE")
 
 
-def drive_file_id(service, folder_id: str, filename: str) -> str:
-    safe_name = filename.replace("\\", "\\\\").replace("'", "\\'")
-    query = f"'{folder_id}' in parents and trashed = false and name = '{safe_name}'"
-    files = (
-        service.files()
-        .list(q=query, spaces="drive", fields="files(id,name)", pageSize=10)
-        .execute()
-        .get("files", [])
-    )
+def escape_drive_value(value):
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def find_file(service, folder_id, filename):
+    query = f"'{folder_id}' in parents and trashed = false and name = '{escape_drive_value(filename)}'"
+    files = service.files().list(q=query, spaces="drive", fields="files(id,name)", pageSize=10).execute().get("files", [])
     if not files:
-        raise FileNotFoundError(f"File not found: {filename}")
+        raise FileNotFoundError(f"File not found in Drive folder: {filename}")
     return files[0]["id"]
 
 
-def download(service, file_id: str) -> bytes:
+def download(service, file_id):
     buffer = io.BytesIO()
     downloader = MediaIoBaseDownload(buffer, service.files().get_media(fileId=file_id))
     done = False
@@ -148,386 +97,301 @@ def download(service, file_id: str) -> bytes:
     return buffer.getvalue()
 
 
-def parse_datetime(series):
+def detect_header_and_read(data, filename):
+    preview = pd.read_excel(io.BytesIO(data), sheet_name=0, header=None, nrows=20, engine="openpyxl")
+    targets = {norm("STATE"), norm("QDC_Name")}
+    scores = []
+    for row_number in range(len(preview)):
+        values = {norm(value) for value in preview.iloc[row_number].tolist() if pd.notna(value)}
+        scores.append((len(targets & values), row_number))
+    header_row = max(scores)[1] if scores else 0
+    frame = pd.read_excel(io.BytesIO(data), sheet_name=0, header=header_row, engine="openpyxl")
+    frame.columns = [str(column).strip() for column in frame.columns]
+    logging.info("%s: detected header row %s with %s rows x %s columns", filename, header_row + 1, len(frame), len(frame.columns))
+    return frame, header_row + 1
+
+
+def parse_dates(series):
     text = clean(series)
-    parsed = pd.to_datetime(text, format="%d/%m/%Y, %H:%M:%S", errors="coerce")
+    parsed = pd.to_datetime(text, format="ISO8601", errors="coerce")
     unresolved = parsed.isna() & text.notna()
     if unresolved.any():
         try:
-            parsed.loc[unresolved] = pd.to_datetime(
-                text.loc[unresolved], format="mixed", dayfirst=True, errors="coerce"
-            )
-        except TypeError:
-            parsed.loc[unresolved] = pd.to_datetime(
-                text.loc[unresolved], dayfirst=True, errors="coerce"
-            )
+            parsed.loc[unresolved] = pd.to_datetime(text.loc[unresolved], format="mixed", dayfirst=True, errors="coerce")
+        except (TypeError, ValueError):
+            parsed.loc[unresolved] = pd.to_datetime(text.loc[unresolved], dayfirst=True, errors="coerce")
     return parsed
 
 
-def standardize(raw: pd.DataFrame, tool: str, filename: str):
+def coordinate(series, latitude):
+    values = pd.to_numeric(series, errors="coerce")
+    return values.where(values.between(-90, 90) if latitude else values.between(-180, 180))
+
+
+def standardize(raw, tool, filename, header_row):
     detected = {key: find_column(raw.columns, aliases) for key, aliases in ALIASES.items()}
-    if not detected["state"] or not detected["investigator"]:
-        raise ValueError(f"{filename}: missing State or Investigator/QDC column")
+    lat_col = find_column(raw.columns, GPS_ALIASES[tool][0])
+    lon_col = find_column(raw.columns, GPS_ALIASES[tool][1])
+    missing = [key for key in ("state", "fi", "submission") if not detected[key]]
+    if missing:
+        raise ValueError(f"{filename}: missing required column(s): {', '.join(missing)}")
+    if not lat_col or not lon_col:
+        raise ValueError(f"{filename}: missing GPS columns. Expected {GPS_ALIASES[tool][0][0]} and {GPS_ALIASES[tool][1][0]}")
 
     frame = raw.copy()
+    frame["__Tool"] = tool
     frame["__State"] = clean(frame[detected["state"]])
-    frame["__Investigator"] = clean(frame[detected["investigator"]])
-
-    level_source = detected["facility_level"] or detected["facility_type"]
-    if level_source:
-        dh_values = {normalize(value) for value in DH_VALUES}
-        frame["__Level"] = clean(frame[level_source]).map(
-            lambda value: "DH" if normalize(value) in dh_values else "Below DH"
-        )
-    else:
-        frame["__Level"] = "Unclassified"
-
-    if detected["submission_date"]:
-        frame["__DateTime"] = parse_datetime(frame[detected["submission_date"]])
-        invalid_dates = int(frame["__DateTime"].isna().sum())
-    else:
-        frame["__DateTime"] = pd.NaT
-        invalid_dates = "Not supplied"
+    frame["__FI"] = clean(frame[detected["fi"]])
+    frame["__DateTime"] = parse_dates(frame[detected["submission"]])
+    frame["__Date"] = frame["__DateTime"].dt.normalize()
+    frame["__Latitude"] = coordinate(frame[lat_col], True)
+    frame["__Longitude"] = coordinate(frame[lon_col], False)
+    frame["__AWC"] = clean(frame[detected["awc_code"]]) if detected["awc_code"] else (clean(frame[detected["awc_name"]]) if detected["awc_name"] else pd.NA)
 
     log = {
-        "Tool": LABELS[tool],
-        "File": filename,
-        "Rows_Read": len(raw),
-        "State_Column": detected["state"],
-        "Investigator_Column": detected["investigator"],
-        "Facility_Level_Column": level_source or "",
-        "Submission_Date_Column": detected["submission_date"] or "",
-        "Invalid_Submission_Dates": invalid_dates,
-        "Status": "OK",
+        "Tool": tool, "File": filename, "Header Row": header_row, "Rows Read": len(frame),
+        "State Column": detected["state"], "FI Column": detected["fi"],
+        "Submission Column": detected["submission"], "Latitude Column": lat_col,
+        "Longitude Column": lon_col, "Valid Dates": int(frame["__Date"].notna().sum()),
+        "Valid GPS": int((frame["__Latitude"].notna() & frame["__Longitude"].notna()).sum()), "Status": "OK",
     }
     return frame, log
 
 
-def load_all(service, folder_id: str):
-    frames = {}
-    logs = []
-    for tool, filename in TOOLS:
+def load_all(service, folder_id):
+    frames, logs = {}, []
+    for tool, filename in TOOL_FILES:
         logging.info("Reading %s", filename)
         try:
-            file_bytes = download(service, drive_file_id(service, folder_id, filename))
-            raw = pd.read_csv(io.BytesIO(file_bytes), low_memory=False, encoding="utf-8-sig")
-            frames[tool], log = standardize(raw, tool, filename)
+            raw, header_row = detect_header_and_read(download(service, find_file(service, folder_id, filename)), filename)
+            frames[tool], log = standardize(raw, tool, filename, header_row)
             logs.append(log)
         except Exception as exc:
             logging.exception("Could not process %s", filename)
-            logs.append({
-                "Tool": LABELS[tool],
-                "File": filename,
-                "Rows_Read": 0,
-                "Status": f"ERROR: {exc}",
-            })
-    if not frames:
-        raise ValueError("No Google Drive CSV file could be processed")
+            logs.append({"Tool": tool, "File": filename, "Rows Read": 0, "Status": f"ERROR: {exc}"})
+    missing_tools = sorted(set(tool for tool, _ in TOOL_FILES) - set(frames))
+    if missing_tools:
+        raise ValueError("Report stopped because these tools could not be processed: " + ", ".join(missing_tools))
     return frames, pd.DataFrame(logs)
 
 
-def canonical_state_names(frames) -> list[str]:
-    groups = {}
+def normalize_state(value):
+    return str(value).strip().casefold()
+
+
+def states_from_frames(frames):
+    grouped = {}
     for frame in frames.values():
         for value in frame["__State"].dropna().unique():
             display = str(value).strip()
             if display:
-                groups.setdefault(normalize_state(display), []).append(display)
-    # This merges values such as ASSAM and Assam into one state workbook.
-    states = []
-    for values in groups.values():
-        states.append(max(values, key=lambda value: (sum(v == value for v in values), len(value))))
-    return sorted(states, key=str.casefold)
-
-
-def selected_states(frames) -> list[str]:
-    states = canonical_state_names(frames)
-    requested = env("STATES")
-    if requested:
-        wanted = {normalize_state(value) for value in requested.split(",") if value.strip()}
+                grouped.setdefault(normalize_state(display), []).append(display)
+    states = [max(values, key=lambda value: (values.count(value), len(value))) for values in grouped.values()]
+    selected = env("STATES")
+    if selected:
+        wanted = {normalize_state(value) for value in selected.split(",") if value.strip()}
         states = [state for state in states if normalize_state(state) in wanted]
     excluded = {normalize_state(value) for value in env("EXCLUDED_STATES").split(",") if value.strip()}
-    if excluded:
-        states = [state for state in states if normalize_state(state) not in excluded]
-    return states
+    return sorted([state for state in states if normalize_state(state) not in excluded], key=str.casefold)
 
 
-def filter_state(frame: pd.DataFrame, state: str) -> pd.DataFrame:
-    mask = frame["__State"].fillna("").str.strip().str.casefold() == normalize_state(state)
-    return frame.loc[mask].copy()
+def state_data(frames, state):
+    parts = []
+    for frame in frames.values():
+        mask = frame["__State"].fillna("").str.strip().str.casefold() == normalize_state(state)
+        parts.append(frame.loc[mask].copy())
+    return pd.concat(parts, ignore_index=True, sort=False)
 
 
-def investigators(frames) -> list[str]:
-    return sorted(
-        {
-            str(value).strip()
-            for frame in frames.values()
-            for value in frame["__Investigator"].dropna().unique()
-            if str(value).strip()
-        },
-        key=str.casefold,
-    )
+def latest_fi_tool_table(data):
+    valid = data.dropna(subset=["__FI", "__Date"])
+    if valid.empty:
+        return pd.DataFrame()
+    latest_date = valid["__Date"].max()
+    latest = valid.loc[valid["__Date"] == latest_date]
+    table = latest.pivot_table(index="__FI", columns="__Tool", values="__State", aggfunc="size", fill_value=0).reset_index()
+    table = table.rename(columns={"__FI": "Name of Field Investigators"})
+    for tool, _ in TOOL_FILES:
+        if tool not in table.columns:
+            table[tool] = 0
+    table["Total Submissions"] = table[[tool for tool, _ in TOOL_FILES]].sum(axis=1)
+    total = {"Name of Field Investigators": "Total Submissions", **{tool: int(table[tool].sum()) for tool, _ in TOOL_FILES}, "Total Submissions": int(table["Total Submissions"].sum())}
+    table = pd.concat([table, pd.DataFrame([total])], ignore_index=True)
+    return table, latest_date
 
 
-def counts(frame, names):
-    if frame is None or frame.empty:
-        return [0] * len(names)
-    grouped = frame.dropna(subset=["__Investigator"]).groupby("__Investigator").size()
-    lookup = {str(name).strip().casefold(): int(count) for name, count in grouped.items()}
-    return [lookup.get(name.casefold(), 0) for name in names]
-
-
-def nurse_report(frames, names):
-    report = pd.DataFrame({"Name of Nursing Consultants": names})
-    for tool, _ in TOOLS:
-        report[f"# {LABELS[tool]}"] = counts(frames.get(tool), names)
-    total = {report.columns[0]: "Grand Total", **{c: int(report[c].sum()) for c in report.columns[1:]}}
-    return pd.concat([report, pd.DataFrame([total])], ignore_index=True)
-
-
-def dh_report(frames, names):
-    report = pd.DataFrame({"Name of Nurses": names})
-    for tool, _ in TOOLS:
-        frame = frames.get(tool)
-        for level in ("Below DH", "DH"):
-            subset = None if frame is None else frame.loc[frame["__Level"] == level]
-            report[f"{LABELS[tool]} - {level}"] = counts(subset, names)
-    total = {"Name of Nurses": "Grand Total", **{c: int(report[c].sum()) for c in report.columns[1:]}}
-    return pd.concat([report, pd.DataFrame([total])], ignore_index=True)
-
-
-def shift_counts(frame, names, day: bool):
-    if frame is None or frame.empty:
-        return [0] * len(names)
-    valid = frame["__DateTime"].notna()
-    hour = frame["__DateTime"].dt.hour
-    day_mask = valid & (hour >= DAY_START_HOUR) & (hour < DAY_END_HOUR)
-    return counts(frame.loc[day_mask if day else valid & ~day_mask], names)
-
-
-def parse_spoc_mapping() -> dict:
-    mapping = DEFAULT_STATE_SPOC.copy()
-    raw = env("STATE_SPOC_JSON")
-    if raw:
-        supplied = json.loads(raw)
-        if not isinstance(supplied, dict):
-            raise ValueError("STATE_SPOC_JSON must be a JSON object")
-        mapping.update({str(key).strip(): str(value).strip() for key, value in supplied.items()})
-    return {normalize_state(key): value for key, value in mapping.items()}
-
-
-def summary_report(state, frames, names, spoc_mapping):
-    report = pd.DataFrame({
-        "Name of Nursing Consultants": names,
-        "State": [state] * len(names),
-        "State SPOC": [spoc_mapping.get(normalize_state(state), "")] * len(names),
-    })
-    for tool, _ in TOOLS:
-        report[LABELS[tool]] = counts(frames.get(tool), names)
-    position = report.columns.get_loc("FIS") + 1
-    report.insert(position, "FIS-Day (9AM-6PM)", shift_counts(frames.get("FIS"), names, True))
-    report.insert(position + 1, "FIS-Night (6PM-9AM)", shift_counts(frames.get("FIS"), names, False))
-    return report
-
-
-def safe_filename(value: str) -> str:
-    return re.sub(r'[<>:"/\\|?*]+', "_", value).strip() or "Unknown_State"
-
-
-def sheet_name(filename: str) -> str:
-    return re.sub(r"[\\/*?:\[\]]", "_", Path(filename).stem).strip()[:31] or "Raw_Data"
-
-
-def sample_widths(df, cap):
-    sample = df.head(100)
-    result = []
-    for column in df.columns:
-        lengths = sample[column].dropna().astype(str).str.len()
-        maximum = max(len(str(column)), int(lengths.max()) if not lengths.empty else 0)
-        result.append(min(max(maximum + 2, 10), cap))
-    return result
-
-
-def format_sheet(ws, df, header, total=None, row=0, freeze=(1, 0), cap=24):
-    ws.freeze_panes(*freeze)
-    if len(df.columns):
-        ws.autofilter(row, 0, row + len(df), len(df.columns) - 1)
-    ws.set_row(row, 38, header)
-    for index, width in enumerate(sample_widths(df, cap)):
-        ws.set_column(index, index, width)
-    if total is not None:
-        ws.set_row(row + len(df), None, total)
-
-
-def create_state_report(state, frames, process_log, output_dir, spoc_mapping):
-    state_frames = {tool: filter_state(frame, state) for tool, frame in frames.items()}
-    names = investigators(state_frames)
-    if not names:
-        logging.warning("Skipping %s because no investigators were found", state)
-        return None
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    report_date = datetime.now().strftime("%d-%m-%Y")
-    path = output_dir / f"{safe_filename(state).upper()}_Tool_Submission_Report_{report_date}.xlsx"
-    logging.info("Starting workbook for %s", state)
-
-    nurse_df = flatten(nurse_report(state_frames, names))
-    dh_df = flatten(dh_report(state_frames, names))
-    summary_df = flatten(summary_report(state, state_frames, names, spoc_mapping))
-
-    with pd.ExcelWriter(path, engine="xlsxwriter", engine_kwargs={"options": {"strings_to_urls": False}}) as writer:
-        workbook = writer.book
-        header = workbook.add_format({
-            "bold": True, "bg_color": "#B7DEE8", "border": 1,
-            "align": "center", "valign": "vcenter", "text_wrap": True,
+def latest_vs_previous_tool_table(data):
+    valid = data.dropna(subset=["__Date"])
+    dates = sorted(valid["__Date"].unique())
+    if not dates:
+        return pd.DataFrame(), pd.NaT, pd.NaT
+    latest_date = dates[-1]
+    previous_date = dates[-2] if len(dates) > 1 else pd.NaT
+    rows = []
+    for tool, _ in TOOL_FILES:
+        latest_count = int(((valid["__Date"] == latest_date) & (valid["__Tool"] == tool)).sum())
+        previous_count = int(((valid["__Date"] == previous_date) & (valid["__Tool"] == tool)).sum()) if pd.notna(previous_date) else 0
+        change = latest_count - previous_count
+        change_pct = (change / previous_count) if previous_count else (0.0 if latest_count == 0 else np.nan)
+        rows.append({
+            "Tool": tool, "Latest Date Count": latest_count, "Previous Active Date Count": previous_count,
+            "Change": change, "% Change": change_pct,
         })
-        total = workbook.add_format({"bold": True, "bg_color": "#B7DEE8", "border": 1})
-        title = workbook.add_format({"bold": True, "font_size": 14, "bottom": 1})
+    return pd.DataFrame(rows), latest_date, previous_date
 
-        nurse_df.to_excel(writer, sheet_name="Nurse Wise", index=False)
-        format_sheet(writer.sheets["Nurse Wise"], nurse_df, header, total, cap=32)
 
-        dh_df.to_excel(writer, sheet_name="DH & Below DH", index=False)
-        format_sheet(writer.sheets["DH & Below DH"], dh_df, header, total, cap=24)
+def haversine(lat1, lon1, lat2, lon2):
+    if any(pd.isna(v) for v in (lat1, lon1, lat2, lon2)):
+        return np.nan
+    radius = 6371.0088
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return radius * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-        summary_df.to_excel(writer, sheet_name="Summary", index=False, startrow=2)
-        summary_ws = writer.sheets["Summary"]
-        summary_ws.write(0, 0, f"GAVB Facility Tool Data collection status as on {report_date}", title)
-        format_sheet(summary_ws, summary_df, header, row=2, freeze=(3, 1), cap=28)
 
-        for tool, filename in TOOLS:
-            if tool not in state_frames:
-                continue
-            raw = flatten(
-                state_frames[tool].drop(
-                    columns=[c for c in state_frames[tool].columns if str(c).startswith("__")],
-                    errors="ignore",
-                )
-            )
-            raw_sheet = sheet_name(filename)
-            logging.info("%s: writing %s (%s rows x %s columns)", state, raw_sheet, len(raw), len(raw.columns))
-            raw.to_excel(writer, sheet_name=raw_sheet, index=False)
-            format_sheet(writer.sheets[raw_sheet], raw, header, cap=24)
+def weekly_travel_summary(data):
+    gps = data.dropna(subset=["__FI", "__Date", "__Latitude", "__Longitude"]).copy()
+    if gps.empty:
+        return pd.DataFrame()
+    daily = gps.groupby(["__FI", "__Date"], as_index=False).agg(Latitude=("__Latitude", "median"), Longitude=("__Longitude", "median"))
+    daily = daily.sort_values(["__FI", "__Date"])
+    daily["Previous Latitude"] = daily.groupby("__FI")["Latitude"].shift()
+    daily["Previous Longitude"] = daily.groupby("__FI")["Longitude"].shift()
+    daily["Distance km"] = daily.apply(lambda row: haversine(row["Previous Latitude"], row["Previous Longitude"], row["Latitude"], row["Longitude"]), axis=1)
+    iso = daily["__Date"].dt.isocalendar()
+    daily["ISO Year"] = iso.year.astype(int)
+    daily["ISO Week"] = iso.week.astype(int)
+    daily["Week Start"] = daily["__Date"] - pd.to_timedelta(daily["__Date"].dt.weekday, unit="D")
+    fi_week = daily.groupby(["__FI", "ISO Year", "ISO Week", "Week Start"], as_index=False).agg(
+        Weekly_Travel_km=("Distance km", "sum"), GPS_Active_Days=("__Date", "nunique"), Valid_Distance_Comparisons=("Distance km", "count")
+    )
+    fi_week["Travelled >= 10 km"] = np.where(fi_week["Valid_Distance_Comparisons"] > 0, fi_week["Weekly_Travel_km"] >= WEEKLY_TRAVEL_KM, False)
+    summary = fi_week.groupby(["ISO Year", "ISO Week", "Week Start"], as_index=False).agg(
+        FIs_with_Valid_GPS_Comparisons=("__FI", "nunique"),
+        FIs_Travelled_At_Least_10_km=("Travelled >= 10 km", "sum"),
+    )
+    summary["Percent FIs Travelled >= 10 km"] = np.where(summary["FIs_with_Valid_GPS_Comparisons"] > 0, summary["FIs_Travelled_At_Least_10_km"] / summary["FIs_with_Valid_GPS_Comparisons"], np.nan)
+    return summary.sort_values("Week Start", ascending=False)
 
-        state_log = flatten(process_log.assign(State_Workbook=state))
-        state_log.to_excel(writer, sheet_name="Processing Log", index=False)
-        format_sheet(writer.sheets["Processing Log"], state_log, header, cap=45)
 
+def safe_filename(value):
+    return re.sub(r'[<>:"/\\|?*]+', "_", str(value)).strip() or "Unknown_State"
+
+
+def format_sheet(writer, sheet_name, df, title=None, date_columns=None, percent_columns=None, zero_highlight_columns=None):
+    ws = writer.sheets[sheet_name]
+    wb = writer.book
+    header_row = 2 if title else 0
+    header = wb.add_format({"bold": True, "bg_color": "#B7DEE8", "border": 1, "align": "center", "valign": "vcenter", "text_wrap": True})
+    title_fmt = wb.add_format({"bold": True, "font_size": 14})
+    date_fmt = wb.add_format({"num_format": "dd-mm-yyyy"})
+    percent_fmt = wb.add_format({"num_format": "+0.0%;-0.0%;-"})
+    zero_fmt = wb.add_format({"bg_color": "#F4CCCC"})
+    if title:
+        ws.write(0, 0, title, title_fmt)
+    ws.set_row(header_row, 36, header)
+    ws.freeze_panes(header_row + 1, 1)
+    if len(df.columns):
+        ws.autofilter(header_row, 0, header_row + len(df), len(df.columns) - 1)
+    for index, column in enumerate(df.columns):
+        lengths = df.head(100)[column].dropna().astype(str).str.len()
+        width = min(max(len(str(column)) + 2, int(lengths.max()) + 2 if not lengths.empty else 10), 34)
+        column_format = date_fmt if date_columns and column in date_columns else percent_fmt if percent_columns and column in percent_columns else None
+        ws.set_column(index, index, width, column_format)
+        if zero_highlight_columns and column in zero_highlight_columns and len(df):
+            ws.conditional_format(header_row + 1, index, header_row + len(df), index, {"type": "cell", "criteria": "==", "value": 0, "format": zero_fmt})
+
+
+def create_workbook(state, data, logs, output_dir):
+    fi_table, latest_date = latest_fi_tool_table(data)
+    comparison, comparison_latest, previous_date = latest_vs_previous_tool_table(data)
+    weekly = weekly_travel_summary(data)
+    if fi_table.empty:
+        raise ValueError(f"{state}: no valid FI/date records")
+
+    report_date = datetime.now().strftime("%d-%m-%Y")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / f"{safe_filename(state).upper()}_IDD_Extension_Submission_Summary_{report_date}.xlsx"
+    with pd.ExcelWriter(path, engine="xlsxwriter", engine_kwargs={"options": {"strings_to_urls": False}}) as writer:
+        fi_table.to_excel(writer, sheet_name="Latest FI Tool Status", index=False, startrow=2)
+        format_sheet(writer, "Latest FI Tool Status", fi_table,
+                     title=f"Total Submissions status as on: {latest_date:%d-%m-%Y} | {state}",
+                     zero_highlight_columns={tool for tool, _ in TOOL_FILES})
+
+        comparison.to_excel(writer, sheet_name="Latest vs Previous", index=False, startrow=2)
+        previous_text = f"{previous_date:%d-%m-%Y}" if pd.notna(previous_date) else "Not available"
+        format_sheet(writer, "Latest vs Previous", comparison,
+                     title=f"Tool submission comparison: {comparison_latest:%d-%m-%Y} vs {previous_text} | {state}",
+                     percent_columns={"% Change"}, zero_highlight_columns={"Latest Date Count"})
+
+        weekly.to_excel(writer, sheet_name="Weekly 10km Travel", index=False)
+        format_sheet(writer, "Weekly 10km Travel", weekly, date_columns={"Week Start"}, percent_columns={"Percent FIs Travelled >= 10 km"})
+
+        logs.assign(State_Workbook=state).to_excel(writer, sheet_name="Processing Log", index=False)
+        format_sheet(writer, "Processing Log", logs.assign(State_Workbook=state))
+
+        for tool, _ in TOOL_FILES:
+            raw = data.loc[data["__Tool"] == tool].drop(columns=[c for c in data.columns if str(c).startswith("__")], errors="ignore")
+            sheet = re.sub(r"[\\/*?:\[\]]", "_", f"Raw {tool}")[:31]
+            raw.to_excel(writer, sheet_name=sheet, index=False)
+            format_sheet(writer, sheet, raw)
     logging.info("Created state workbook: %s", path)
     return path
 
 
-def create_zip(report_paths, output_dir):
-    date = datetime.now().strftime("%d-%m-%Y")
-    zip_path = output_dir / f"ALL_STATES_GAVB_Reports_{date}.zip"
-    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-        for report_path in report_paths:
-            archive.write(report_path, arcname=report_path.name)
-    logging.info("Created ZIP package: %s", zip_path)
-    return zip_path
+def create_zip(paths, output_dir):
+    path = output_dir / f"IDD_Extension_Submission_Summary_All_States_{datetime.now():%d-%m-%Y}.zip"
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        for report in paths:
+            archive.write(report, arcname=report.name)
+    return path
 
 
-def send_email(attachment: Path, states: list[str]):
+def send_email(attachment, states):
     sender = env("SMTP_EMAIL", "GMAIL_USERNAME", "EMAIL_USERNAME", required=True)
     password = env("SMTP_APP_PASSWORD", "GMAIL_APP_PASSWORD", "EMAIL_PASSWORD", required=True)
-    raw_recipients = env("RECIPIENTS", "REPORT_RECIPIENTS", "EMAIL_TO", required=True)
-    recipients = [value.strip() for value in re.split(r"[,;]", raw_recipients) if value.strip()]
-    if not recipients:
-        raise ValueError("RECIPIENTS is empty")
-
+    recipients = [x.strip() for x in re.split(r"[,;]", env("RECIPIENTS", "REPORT_RECIPIENTS", "EMAIL_TO", required=True)) if x.strip()]
+    size_mb = attachment.stat().st_size / (1024 * 1024)
+    maximum = float(env("MAX_EMAIL_ATTACHMENT_MB") or "24")
+    if size_mb > maximum:
+        raise ValueError(f"ZIP attachment is {size_mb:.2f} MB, above configured limit {maximum:.2f} MB")
     message = EmailMessage()
-    message["From"] = sender
-    message["To"] = ", ".join(recipients)
-    message["Subject"] = env("MAIL_SUBJECT", "EMAIL_SUBJECT") or (
-        f"All States GAVB Tool Submission Reports - {datetime.now():%d-%m-%Y}"
-    )
-    state_list = ", ".join(states)
-    message.set_content(
-        env("MAIL_BODY", "EMAIL_BODY")
-        or (
-            "Dear Team,\n\n"
-            "Please find attached the latest GAVB Tool Submission Reports for all detected states.\n\n"
-            f"States included: {state_list}\n\n"
-            "Regards,\nGAVB Reporting Automation"
-        )
-    )
-
+    message["From"], message["To"] = sender, ", ".join(recipients)
+    message["Subject"] = env("MAIL_SUBJECT", "EMAIL_SUBJECT") or f"IDD Extension Submission Summary - {datetime.now():%d-%m-%Y}"
+    message.set_content(env("MAIL_BODY", "EMAIL_BODY") or f"Dear Team,\n\nPlease find attached the IDD Extension submission summary for: {', '.join(states)}.\n\nRegards,\nGAVB Reporting Automation")
     with attachment.open("rb") as handle:
-        message.add_attachment(
-            handle.read(),
-            maintype="application",
-            subtype="zip",
-            filename=attachment.name,
-        )
-
-    max_attachment_mb = float(env("MAX_EMAIL_ATTACHMENT_MB") or "24")
-    attachment_mb = attachment.stat().st_size / (1024 * 1024)
-    if attachment_mb > max_attachment_mb:
-        raise ValueError(
-            f"ZIP attachment is {attachment_mb:.2f} MB, above MAX_EMAIL_ATTACHMENT_MB={max_attachment_mb:.2f}. "
-            "Reduce raw sheets, split the reports, or increase the configured limit only if your mail account supports it."
-        )
-
-    logging.info(
-        "Email configuration detected: SMTP_EMAIL=%s, SMTP_APP_PASSWORD=%s, RECIPIENTS=%s, MAIL_SUBJECT=%s",
-        bool(sender), bool(password), bool(recipients), bool(message["Subject"]),
-    )
-    logging.info("Sending %s reports in ZIP attachment %.2f MB", len(states), attachment_mb)
-
-    smtp_host = env("SMTP_HOST") or "smtp.gmail.com"
-    smtp_port = int(env("SMTP_PORT") or "465")
-    with smtplib.SMTP_SSL(
-        smtp_host,
-        smtp_port,
-        context=ssl.create_default_context(),
-        timeout=60,
-    ) as smtp:
+        message.add_attachment(handle.read(), maintype="application", subtype="zip", filename=attachment.name)
+    with smtplib.SMTP_SSL(env("SMTP_HOST") or "smtp.gmail.com", int(env("SMTP_PORT") or "465"), context=ssl.create_default_context(), timeout=60) as smtp:
         smtp.login(sender, password)
         smtp.send_message(message)
     logging.info("Email sent successfully to %s recipient(s)", len(recipients))
 
 
 def main():
-    logging.basicConfig(
-        level=(env("LOG_LEVEL") or "INFO").upper(),
-        format="%(asctime)s [%(levelname)s] %(message)s",
-    )
+    logging.basicConfig(level=(env("LOG_LEVEL") or "INFO").upper(), format="%(asctime)s [%(levelname)s] %(message)s")
     try:
         logging.info("Running report script version: %s", SCRIPT_VERSION)
         folder_id = env("DRIVE_FOLDER_ID", required=True)
-        output_dir = Path(
-            env("LOCAL_OUTPUT_FOLDER")
-            or f"/tmp/{datetime.now(timezone.utc):%Y-%m-%d}/state_reports"
-        )
-
-        service = build("drive", "v3", credentials=build_credentials(), cache_discovery=False)
-        frames, process_log = load_all(service, folder_id)
-        states = selected_states(frames)
-        if not states:
-            raise ValueError("No reportable states were found")
-
-        logging.info("States selected for report generation: %s", ", ".join(states))
-        spoc_mapping = parse_spoc_mapping()
-        reports = []
-        completed_states = []
+        output_dir = Path(env("LOCAL_OUTPUT_FOLDER") or f"/tmp/{datetime.now(timezone.utc):%Y-%m-%d}/idd_extension_summary")
+        service = build("drive", "v3", credentials=credentials(), cache_discovery=False)
+        frames, logs = load_all(service, folder_id)
+        states = states_from_frames(frames)
+        reports, completed = [], []
         for state in states:
-            report = create_state_report(state, frames, process_log, output_dir, spoc_mapping)
-            if report is not None:
-                reports.append(report)
-                completed_states.append(state)
-
+            data = state_data(frames, state)
+            if not data.empty:
+                reports.append(create_workbook(state, data, logs, output_dir))
+                completed.append(state)
         if not reports:
             raise ValueError("No state workbook was created")
-
         zip_path = create_zip(reports, output_dir)
-        send_email(zip_path, completed_states)
-
-        print("Created state workbooks:")
+        send_email(zip_path, completed)
+        print("Created reports:")
         for report in reports:
             print(f" - {report}")
         print(f"Email attachment: {zip_path}")
         return 0
-
     except (ValueError, FileNotFoundError, json.JSONDecodeError) as exc:
         logging.error("Configuration/runtime error: %s", exc)
         return 2
@@ -547,4 +411,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
