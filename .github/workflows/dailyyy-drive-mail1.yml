@@ -12,7 +12,7 @@ permissions:
 jobs:
   run-daily-mailer:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
       DRIVE_FOLDER_ID: ${{ secrets.DRIVE_FOLDER_ID }}
